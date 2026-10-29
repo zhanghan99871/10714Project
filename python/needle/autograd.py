@@ -1,8 +1,7 @@
 """Core data structures."""
 import needle
-from .backend_numpy import Device, cpu, all_devices
-from typing import List, Optional, NamedTuple, Tuple, Union
-from collections import namedtuple
+from .backend_numpy import Device, cpu
+from typing import List, Optional, Dict, Tuple, Union, TYPE_CHECKING, Any
 import numpy
 
 from needle import init
@@ -14,10 +13,12 @@ TENSOR_COUNTER = 0
 # NOTE: we will import numpy as the array_api
 # as the backend for our computations, this line will change in later homeworks
 
-import numpy as array_api
-NDArray = numpy.ndarray
+if TYPE_CHECKING:
+    from .backend_ndarray import NDArray
+else:
+    from .backend_selection import NDArray
 
-from .backend_selection import array_api, NDArray
+from .backend_selection import array_api
 
 class Op:
     """Operator definition."""
