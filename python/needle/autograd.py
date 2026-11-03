@@ -1,7 +1,8 @@
 """Core data structures."""
 import needle
-from .backend_numpy import Device, cpu
-from typing import List, Optional, Dict, Tuple, Union, TYPE_CHECKING, Any
+from .backend_numpy import Device, all_devices
+from typing import List, Optional, NamedTuple, Tuple, Union, Dict, TYPE_CHECKING
+from collections import namedtuple
 import numpy
 
 from needle import init
@@ -13,12 +14,10 @@ TENSOR_COUNTER = 0
 # NOTE: we will import numpy as the array_api
 # as the backend for our computations, this line will change in later homeworks
 
-if TYPE_CHECKING:
-    from .backend_ndarray import NDArray
-else:
-    from .backend_selection import NDArray
+import numpy as array_api
+NDArray = numpy.ndarray
 
-from .backend_selection import array_api
+from .backend_selection import array_api, NDArray, default_device, cpu
 
 class Op:
     """Operator definition."""
@@ -217,7 +216,7 @@ class Tensor(Value):
                     array.numpy(), device=device, dtype=dtype
                 )
         else:
-            device = device if device else cpu()
+            device = device if device else default_device()
             cached_data = Tensor._array_from_numpy(array, device=device, dtype=dtype)
 
         self._init(
@@ -306,7 +305,7 @@ class Tensor(Value):
     def numpy(self):
         data = self.realize_cached_data()
         if array_api is numpy:
-            return data
+            return numpy.array(data)
         return data.numpy()
 
     def __add__(self, other):
@@ -362,9 +361,9 @@ class Tensor(Value):
 
 
 
+
     __radd__ = __add__
     __rmul__ = __mul__
-
 
 def compute_gradient_of_variables(output_tensor, out_grad):
     """Take gradient of output node with respect to each node in node_list.

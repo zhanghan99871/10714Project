@@ -27,6 +27,8 @@ class SGD(Optimizer):
         ### BEGIN YOUR SOLUTION
         # raise NotImplementedError()
         for param in self.params:
+            if param.grad is None:
+                continue
             grad = param.grad.data + self.weight_decay * param.data 
             if param not in self.u: 
                 ut = 0
@@ -43,7 +45,30 @@ class SGD(Optimizer):
         Note: This does not need to be implemented for HW2 and can be skipped.
         """
         ### BEGIN YOUR SOLUTION
-        raise NotImplementedError()
+        # raise NotImplementedError()
+        grads = [
+            p.grad
+            for p in self.params
+            if p.grad is not None
+        ]
+
+        if not grads:
+            return
+
+        total_norm_sq = 0.0
+
+        for grad in grads:
+            g = grad.numpy()
+            total_norm_sq += np.sum(g * g)
+
+        total_norm = np.sqrt(total_norm_sq)
+
+        if total_norm > max_norm:
+            scale = max_norm / (total_norm + 1e-6)
+
+            for p in self.params:
+                if p.grad is not None:
+                    p.grad.data = p.grad.data * scale
         ### END YOUR SOLUTION
 
 
@@ -73,6 +98,8 @@ class Adam(Optimizer):
         # raise NotImplementedError()
         self.t += 1
         for param in self.params: 
+            if param.grad is None:
+                continue
             grad = param.grad.data + self.weight_decay * param.data 
             if param not in self.m:
                 mt = 0
@@ -89,4 +116,36 @@ class Adam(Optimizer):
             vt /= 1 - self.beta2 ** self.t 
             mt /= 1 - self.beta1 ** self.t  
             param.data -= self.lr * mt / (vt**0.5 + self.eps) 
+        ### END YOUR SOLUTION
+
+    def clip_grad_norm(self, max_norm=0.25):
+        """
+        Clips gradient norm of parameters.
+        Note: This does not need to be implemented for HW2 and can be skipped.
+        """
+        ### BEGIN YOUR SOLUTION
+        # raise NotImplementedError()
+        grads = [
+            p.grad
+            for p in self.params
+            if p.grad is not None
+        ]
+
+        if not grads:
+            return
+
+        total_norm_sq = 0.0
+
+        for grad in grads:
+            g = grad.numpy()
+            total_norm_sq += np.sum(g * g)
+
+        total_norm = np.sqrt(total_norm_sq)
+
+        if total_norm > max_norm:
+            scale = max_norm / (total_norm + 1e-6)
+
+            for p in self.params:
+                if p.grad is not None:
+                    p.grad.data = p.grad.data * scale
         ### END YOUR SOLUTION

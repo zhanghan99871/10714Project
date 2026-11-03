@@ -145,7 +145,7 @@ class SoftmaxLoss(Module):
         ### BEGIN YOUR SOLUTION
         # raise NotImplementedError()
         batch, cls = logits.shape
-        y_one_hot = init.one_hot(cls, y) 
+        y_one_hot = init.one_hot(cls, y, device=logits.device, dtype=logits.dtype) 
         new_y = ops.summation(y_one_hot * logits, axes=(1, ))
         per_batch_loss = ops.logsumexp(logits, axes=(1,)) - new_y
         return ops.summation(per_batch_loss, axes=(0, )) / batch
@@ -186,6 +186,16 @@ class BatchNorm1d(Module):
             return w * (x - mean) / ((var + self.eps) ** 0.5) + b
         ### END YOUR SOLUTION
 
+class BatchNorm2d(BatchNorm1d):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+    def forward(self, x: Tensor):
+        # nchw -> nhcw -> nhwc
+        s = x.shape
+        _x = x.transpose((1, 2)).transpose((2, 3)).reshape((s[0] * s[2] * s[3], s[1]))
+        y = super().forward(_x).reshape((s[0], s[2], s[3], s[1]))
+        return y.transpose((2,3)).transpose((1,2))
 
 
 class LayerNorm1d(Module):

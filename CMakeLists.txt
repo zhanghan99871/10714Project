@@ -1,8 +1,6 @@
-cmake_minimum_required(VERSION 3.10)
+cmake_minimum_required(VERSION 3.5)
 project(needle C CXX)
-if(POLICY CMP0146)
-  cmake_policy(SET CMP0146 OLD)
-endif()
+cmake_policy(SET CMP0146 OLD)
 
 # find correct version of Python
 execute_process(COMMAND python3-config --prefix
@@ -55,7 +53,7 @@ endif()
 ####################
 ### CUDA BACKEND ###
 ####################
-find_package(CUDA QUIET)
+find_package(CUDA)
 if(CUDA_FOUND)
   message(STATUS "Found cuda, building cuda backend")
 
@@ -63,13 +61,12 @@ if(CUDA_FOUND)
   list(APPEND LINKER_LIBS ${CUDA_CUDART_LIBRARY})
 
   # invoke nvidia smi to detect if we really have a GPU
-  execute_process(COMMAND "nvidia-smi" OUTPUT_QUIET ERROR_QUIET RESULT_VARIABLE NV_RET)
+  execute_process(COMMAND "nvidia-smi" ERROR_QUIET  RESULT_VARIABLE NV_RET)
   if(NV_RET EQUAL "0")
     CUDA_SELECT_NVCC_ARCH_FLAGS(ARCH_FLAGS Auto)
   else()
-    # no GPU visible: target the T4 (sm_75) that Colab GPU runtimes use;
-    # CUDA 12+ no longer supports the old K80 (sm_37) default
-    CUDA_SELECT_NVCC_ARCH_FLAGS(ARCH_FLAGS 7.5)
+    # set to 3.7 the flag of K80
+    CUDA_SELECT_NVCC_ARCH_FLAGS(ARCH_FLAGS 3.7)
   endif()
 
   # set arch flags properly
@@ -86,7 +83,6 @@ if(CUDA_FOUND)
     CXX_VISIBILITY_PRESET "hidden"
     CUDA_VISIBILITY_PRESET "hidden"
 )
-else()
-  message(STATUS "CUDA not found, building the CPU backend only")
+
 endif()
 
