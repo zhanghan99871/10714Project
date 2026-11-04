@@ -96,18 +96,43 @@ class Value:
     # The following fields are cached fields for
     # dynamic computation
     cached_data: NDArray
+    _shape: Optional[tuple]
+    _dtype: Optional[str]
+    _device: Optional[Device]
     requires_grad: bool
 
     def realize_cached_data(self):
-        """Run compute to realize the cached data"""
-        # avoid recomputation
         if self.cached_data is not None:
             return self.cached_data
-        # note: data implicitly calls realized cached data
-        self.cached_data = self.op.compute(
+
+        if self.op is None:
+            raise RuntimeError(
+                "Cannot recompute a leaf tensor whose data was released."
+            )
+
+        data = self.op.compute(
             *[x.realize_cached_data() for x in self.inputs]
         )
+
+        self.cached_data = data
+
+        if isinstance(self, Tensor):
+            self._update_metadata(data)
+
         return self.cached_data
+
+    def release_cached_data(self):
+        if self.op is None:
+            raise RuntimeError(
+                "Cannot release leaf tensor data."
+            )
+
+        if self._shape is None:
+            raise RuntimeError(
+                "Cannot release an uninitialized tensor."
+            )
+
+        self.cached_data = None
 
     def is_leaf(self):
         return self.op is None
@@ -115,6 +140,15 @@ class Value:
     def __del__(self):
         global TENSOR_COUNTER
         TENSOR_COUNTER -= 1
+
+    def _update_metadata(self, data):
+        self._shape = tuple(data.shape)
+        self._dtype = str(data.dtype)
+
+        if array_api is numpy:
+            self._device = cpu()
+        else:
+            self._device = data.device
 
     def _init(
         self,
@@ -134,6 +168,12 @@ class Value:
         self.num_outputs = num_outputs
         self.cached_data = cached_data
         self.requires_grad = requires_grad
+        self._shape = None
+        self._dtype = None
+        self._device = None
+
+        if cached_data is not None and isinstance(self, Tensor):
+            self._update_metadata(cached_data)
 
     @classmethod
     def make_const(cls, data, *, requires_grad=False):
@@ -262,10 +302,11 @@ class Tensor(Value):
     @data.setter
     def data(self, value):
         assert isinstance(value, Tensor)
-        assert value.dtype == self.dtype, "%s %s" % (
-            value.dtype,
-            self.dtype,
-        )
+
+        assert value.dtype == self.dtype
+        assert value.shape == self.shape
+        assert value.device == self.device
+
         self.cached_data = value.realize_cached_data()
 
     def detach(self):
@@ -274,19 +315,24 @@ class Tensor(Value):
 
     @property
     def shape(self):
-        return self.realize_cached_data().shape
+        if self._shape is None:
+            self.realize_cached_data()
+        return self._shape
 
     @property
     def dtype(self):
-        return self.realize_cached_data().dtype
+        if self._dtype is None:
+            self.realize_cached_data()
+        return self._dtype
 
     @property
     def device(self):
-        data = self.realize_cached_data()
         # numpy array always sits on cpu
         if array_api is numpy:
             return cpu()
-        return data.device
+        if self._device is None:
+            self.realize_cached_data()
+        return self._device
 
     def backward(self, out_grad=None):
         out_grad = (
