@@ -1,4 +1,4 @@
-"""float16 storage support in the native (cpu / cuda) NDArray backends.
+"""float16 storage support in the NDArray backends (numpy, cpu, cuda).
 
 float16 arrays are stored in 16 bits and computed in float32, so the reference for an
 element-wise op is numpy computed in float32 and rounded to float16 once.
@@ -12,10 +12,11 @@ import pytest
 from needle.backend_ndarray import ndarray as nd
 
 _DEVICES = [
+    nd.cpu_numpy(),
     nd.cpu(),
     pytest.param(nd.cuda(), marks=pytest.mark.skipif(not nd.cuda().enabled(), reason="No GPU")),
 ]
-_IDS = ["cpu", "cuda"]
+_IDS = ["numpy", "cpu", "cuda"]
 f16, f32 = np.float16, np.float32
 
 
@@ -107,13 +108,10 @@ def test_mixed_dtype_rejected(device):
         nd.empty((2,), dtype="int32", device=device)
 
 
-def test_numpy_backend_rejects_float16():
-    with pytest.raises(TypeError, match="does not support"):
-        nd.array(rand16(2, 2), device=nd.cpu_numpy())
-    # float32 is unaffected
-    np.testing.assert_array_equal(
-        nd.array(np.ones(3, f32), device=nd.cpu_numpy()).numpy(), np.ones(3, f32)
-    )
+@pytest.mark.parametrize("device", _DEVICES, ids=_IDS)
+def test_backend_advertises_float16(device):
+    assert device.dtypes == ("float32", "float16")
+    assert device.supports_dtype("float16") and device.supports_dtype(np.float32)
 
 
 # --------------------------------------------------------------------------- casting
@@ -277,3 +275,14 @@ def test_sum_beats_float16_accumulation(device):
     a = np.ones(5000, f16)
     out = nd.array(a, device=device).sum().numpy()
     assert out.dtype == f16 and out[0] == f16(5000)  # float16 accumulation would give 2048
+
+
+@pytest.mark.parametrize("n", [1000, 20000])
+@pytest.mark.parametrize("device", _DEVICES, ids=_IDS)
+def test_sum_random_accumulates_in_float32(n, device):
+    """Random fractions defeat both sequential and pairwise float16 accumulation."""
+    np.random.seed(6)
+    a = np.random.uniform(0, 1, (3, n)).astype(f16)
+    out = nd.array(a, device=device).sum(axis=1).numpy()
+    expected = a.astype(np.float64).sum(axis=1).astype(f16)
+    assert_ulp(out, expected, max_ulp=1)

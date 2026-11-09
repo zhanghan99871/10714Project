@@ -698,7 +698,18 @@ class NDArray:
             )
         return view, out
 
-    def sum(self, axis: int | tuple[int, ...] | list[int] | None = None, keepdims: bool = False) -> "NDArray":
+    def sum(
+        self,
+        axis: int | tuple[int, ...] | list[int] | None = None,
+        keepdims: bool = False,
+        dtype: Any = None,
+    ) -> "NDArray":
+        """Sum over `axis`. The backends always accumulate in float32; `dtype`
+        selects the *output* type, e.g. sum(dtype="float32") on a float16 array
+        returns the float32 total instead of rounding it (and possibly
+        overflowing past 65504) back to float16."""
+        if dtype is not None and normalize_dtype(dtype) != self.dtype:
+            return self.astype(dtype).sum(axis=axis, keepdims=keepdims)
         view, out = self.reduce_view_out(axis, keepdims=keepdims)
         self.device.reduce_sum(view.compact()._handle, out._handle, view.shape[-1])
         return out
@@ -707,6 +718,22 @@ class NDArray:
         view, out = self.reduce_view_out(axis, keepdims=keepdims)
         self.device.reduce_max(view.compact()._handle, out._handle, view.shape[-1])
         return out
+
+    ### Overflow checks (used by mixed precision loss scaling)
+    def isfinite(self) -> "NDArray":
+        """1.0 where the element is finite, 0.0 where it is inf or NaN (same dtype).
+
+        Uses x - x, which is 0 for finite x and NaN for inf / NaN, so it runs on
+        the device without new kernels.
+        """
+        return (self - self) == 0
+
+    def all_finite(self) -> bool:
+        """True if no element is inf or NaN. Transfers a single scalar to the host."""
+        if self.size == 0:
+            return True
+        # sum(x - x) is exactly 0 iff every element is finite; NaN otherwise
+        return bool(self.__sub__(self).sum(dtype="float32").numpy().item() == 0)
 
     def flip(self, axes: tuple[int, ...]) -> "NDArray":
         """
@@ -786,8 +813,25 @@ def tanh(a: NDArray) -> NDArray:
     return a.tanh()
 
 
-def sum(a: NDArray, axis: int | tuple[int] | list[int] | None = None, keepdims: bool = False) -> NDArray:
-    return a.sum(axis=axis, keepdims=keepdims)
+def sum(
+    a: NDArray,
+    axis: int | tuple[int] | list[int] | None = None,
+    keepdims: bool = False,
+    dtype: Any = None,
+) -> NDArray:
+    return a.sum(axis=axis, keepdims=keepdims, dtype=dtype)
+
+
+def astype(a: NDArray, dtype: Any, copy: bool = True) -> NDArray:
+    return a.astype(dtype, copy=copy)
+
+
+def isfinite(a: NDArray) -> NDArray:
+    return a.isfinite()
+
+
+def all_finite(a: NDArray) -> bool:
+    return a.all_finite()
 
 
 def flip(a: NDArray, axes: tuple[int, ...]) -> NDArray:
