@@ -8,4 +8,6 @@ from .init import ones, zeros, zeros_like, ones_like
 from . import data
 from . import nn
 from . import optim
+from . import amp
+from .amp import autocast, is_autocast_enabled, get_autocast_dtype
 from .backend_selection import *

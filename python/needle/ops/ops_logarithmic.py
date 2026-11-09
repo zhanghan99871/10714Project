@@ -2,12 +2,15 @@ from typing import Optional, Any, Union
 from ..autograd import NDArray
 from ..autograd import Op, Tensor, Value, TensorOp
 from ..autograd import TensorTuple, TensorTupleOp
+from ..autograd import AUTOCAST_FP32
 
 from .ops_mathematic import *
 
 from ..backend_selection import array_api, BACKEND 
 
 class LogSoftmax(TensorOp):
+    autocast_policy = AUTOCAST_FP32
+
     def compute(self, Z: NDArray) -> NDArray:
         ### BEGIN YOUR SOLUTION
         # raise NotImplementedError()
@@ -60,6 +63,8 @@ def logsoftmax(a: Tensor) -> Tensor:
 
 
 class LogSumExp(TensorOp):
+    autocast_policy = AUTOCAST_FP32
+
     def __init__(self, axes: Optional[tuple] = None) -> None:
         self.axes = axes
 

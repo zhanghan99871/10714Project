@@ -7,6 +7,7 @@ from ..autograd import NDArray
 from ..autograd import Op, Tensor, Value, TensorOp
 from ..autograd import TensorTuple, TensorTupleOp
 from ..autograd import canonical_dtype
+from ..autograd import AUTOCAST_LOWER, AUTOCAST_FP32, AUTOCAST_SKIP, autocast_promote
 
 # NOTE: we will import numpy as the array_api
 # as the backend for our computations, this line will change in later homeworks
@@ -40,6 +41,7 @@ class Cast(TensorOp):
     every tensor in inference / requires_grad=False code, since those cannot be
     recomputed) and anything in LAZY_MODE, where the cast has not run yet.
     """
+    autocast_policy = AUTOCAST_SKIP
 
     def __init__(self, dtype, release_input: bool = True):
         self.dtype = canonical_dtype(dtype)
@@ -138,6 +140,7 @@ def mul_scalar(a, scalar):
 
 class EWisePow(TensorOp):
     """Op to element-wise raise a tensor to a power."""
+    autocast_policy = AUTOCAST_FP32
 
     def compute(self, a: NDArray, b: NDArray) -> NDArray:
         ### BEGIN YOUR SOLUTION
@@ -164,6 +167,7 @@ def power(a, b):
 
 class PowerScalar(TensorOp):
     """Op raise a tensor to an (integer) power."""
+    autocast_policy = AUTOCAST_FP32
 
     def __init__(self, scalar: int):
         self.scalar = scalar
@@ -319,6 +323,8 @@ def broadcast_to(a, shape):
 
 
 class Summation(TensorOp):
+    autocast_policy = AUTOCAST_FP32
+
     def __init__(self, axes: Optional[tuple] = None):
         self.axes = axes
 
@@ -372,6 +378,8 @@ def summation(a, axes=None):
 
 
 class MatMul(TensorOp):
+    autocast_policy = AUTOCAST_LOWER
+
     def compute(self, a, b):
         ### BEGIN YOUR SOLUTION
         # raise NotImplementedError()
@@ -426,6 +434,8 @@ def negate(a):
 
 
 class Log(TensorOp):
+    autocast_policy = AUTOCAST_FP32
+
     def compute(self, a):
         ### BEGIN YOUR SOLUTION
         # raise NotImplementedError()
@@ -445,6 +455,8 @@ def log(a):
 
 
 class Exp(TensorOp):
+    autocast_policy = AUTOCAST_FP32
+
     def compute(self, a):
         ### BEGIN YOUR SOLUTION
         # raise NotImplementedError()
@@ -557,7 +569,8 @@ class Stack(TensorOp):
 
 
 def stack(args, axis):
-    return Stack(axis)(make_tuple(*args))
+    # under autocast, tensors of mixed dtypes are promoted to the widest one
+    return Stack(axis)(make_tuple(*autocast_promote(args)))
 
 
 class Split(TensorTupleOp):
@@ -770,6 +783,8 @@ def im2col(A, kernel_h, kernel_w, stride=1, padding=0):
 
 
 class Conv(TensorOp):
+    autocast_policy = AUTOCAST_LOWER
+
     def __init__(self, stride: Optional[int] = 1, padding: Optional[int] = 0):
         self.stride = stride
         self.padding = padding
