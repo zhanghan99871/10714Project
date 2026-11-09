@@ -112,9 +112,9 @@ class MultiHeadAttention(Module):
         # raise NotImplementedError()
         qkt = self.matmul(q, k) * (1 / np.sqrt(q_dim)) 
         if self.causal:
-            mask = mask = Tensor(
-                self.create_causal_mask(queries_len, keys_values_len, self.device),
-                device=self.device,
+            mask = Tensor(
+                self.create_causal_mask(queries_len, keys_values_len, q.device),
+                device=q.device,
                 dtype=self.dtype,
                 requires_grad=False,
             )
@@ -361,7 +361,7 @@ class Transformer(Module):
 
         position_ids = Tensor(
             position_ids,
-            device=self.device,
+            device=x.device,
             dtype=self.dtype,
             requires_grad=False
         )

@@ -346,6 +346,16 @@ void ScalarPower(const CudaArray& a, scalar_t val, CudaArray* out) {
   ScalarPowerKernel<<<dim.grid, dim.block>>>(a.ptr, val, out->ptr, out->size);
 }
 
+__global__ void EwisePowerKernel(const scalar_t* a, const scalar_t* b, scalar_t* out, size_t size) {
+  size_t gid = blockIdx.x * blockDim.x + threadIdx.x;
+  if (gid < size) out[gid] = pow(a[gid], b[gid]);
+}
+
+void EwisePower(const CudaArray& a, const CudaArray& b, CudaArray* out) {
+  CudaDims dim = CudaOneDim(out->size);
+  EwisePowerKernel<<<dim.grid, dim.block>>>(a.ptr, b.ptr, out->ptr, out->size);
+}
+
 __global__ void EwiseMaximumKernel(const scalar_t* a, const scalar_t* b, scalar_t* out, size_t size) {
   size_t gid = blockIdx.x * blockDim.x + threadIdx.x;
   if (gid < size) out[gid] = fmaxf(a[gid], b[gid]);
@@ -666,6 +676,7 @@ PYBIND11_MODULE(ndarray_backend_cuda, m) {
   m.def("ewise_div", EwiseDiv);
   m.def("scalar_div", ScalarDiv);
   m.def("scalar_power", ScalarPower);
+  m.def("ewise_power", EwisePower);
 
   m.def("ewise_maximum", EwiseMaximum);
   m.def("scalar_maximum", ScalarMaximum);
