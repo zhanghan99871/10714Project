@@ -2,18 +2,102 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
+#include <algorithm>
 #include <cmath>
+#include <cstdint>
+#include <cstring>
 #include <iostream>
 #include <stdexcept>
+#include <string>
 
 namespace needle {
 namespace cpu {
 
 #define ALIGNMENT 256
 #define TILE 8
-typedef float scalar_t;
-const size_t ELEM_SIZE = sizeof(scalar_t);
 
+/**
+ * Supported element types.
+ *
+ * float32 is stored and computed natively. float16 (IEEE 754 binary16, the same format as
+ * numpy.float16) is a *storage* type: every kernel loads float16 elements, widens them to
+ * float32, computes in float32 and rounds the result back to float16 (round-to-nearest-even).
+ * In particular matmul and reductions always accumulate in float32, which is what mixed
+ * precision training needs.
+ */
+enum class DType { F32, F16 };
+
+struct half_t {
+  uint16_t bits;
+};
+
+inline size_t ElemSize(DType dt) { return dt == DType::F32 ? sizeof(float) : sizeof(half_t); }
+
+inline const char* DTypeName(DType dt) { return dt == DType::F32 ? "float32" : "float16"; }
+
+inline DType ParseDType(const std::string& name) {
+  if (name == "float32") return DType::F32;
+  if (name == "float16") return DType::F16;
+  throw std::invalid_argument("unsupported dtype: " + name);
+}
+
+/// float32 <-> float16 conversion (round-to-nearest-even, matches numpy.float16).
+/// Based on F. Giesen's public domain float_to_half_fast3_rtne / half_to_float.
+inline float bits_to_float(uint32_t u) {
+  float f;
+  std::memcpy(&f, &u, sizeof(f));
+  return f;
+}
+
+inline uint32_t float_to_bits(float f) {
+  uint32_t u;
+  std::memcpy(&u, &f, sizeof(u));
+  return u;
+}
+
+inline uint16_t FloatToHalf(float value) {
+  const uint32_t f32infty = 255u << 23;
+  const uint32_t f16max = (127u + 16u) << 23;
+  const uint32_t denorm_magic = ((127u - 15u) + (23u - 10u) + 1u) << 23;
+  uint32_t u = float_to_bits(value);
+  const uint32_t sign = u & 0x80000000u;
+  u ^= sign;
+  uint16_t o;
+  if (u >= f16max) {
+    // overflow -> inf; NaN stays (quiet) NaN
+    o = (u > f32infty) ? 0x7e00 : 0x7c00;
+  } else if (u < (113u << 23)) {
+    // result is subnormal or zero: let float addition do the rounding
+    float f = bits_to_float(u) + bits_to_float(denorm_magic);
+    o = (uint16_t)(float_to_bits(f) - denorm_magic);
+  } else {
+    const uint32_t mant_odd = (u >> 13) & 1u;
+    u += ((uint32_t)(15 - 127) << 23) + 0xfffu;  // rebias exponent, rounding bias part 1
+    u += mant_odd;                                // rounding bias part 2 (ties to even)
+    o = (uint16_t)(u >> 13);
+  }
+  return (uint16_t)(o | (sign >> 16));
+}
+
+inline float HalfToFloat(uint16_t h) {
+  const uint32_t shifted_exp = 0x7c00u << 13;
+  uint32_t o = ((uint32_t)(h & 0x7fffu)) << 13;
+  const uint32_t exp = shifted_exp & o;
+  o += (uint32_t)(127 - 15) << 23;
+  if (exp == shifted_exp) {
+    o += (uint32_t)(128 - 16) << 23;  // inf / NaN
+  } else if (exp == 0) {
+    o += 1u << 23;  // zero / subnormal: renormalize
+    o = float_to_bits(bits_to_float(o) - bits_to_float(113u << 23));
+  }
+  return bits_to_float(o | ((uint32_t)(h & 0x8000u) << 16));
+}
+
+/// Element access: every kernel reads and writes through these, computing in float.
+inline float Load(const float* p, size_t i) { return p[i]; }
+inline float Load(const half_t* p, size_t i) { return HalfToFloat(p[i].bits); }
+inline void Store(float* p, size_t i, float v) { p[i] = v; }
+inline void Store(half_t* p, size_t i, float v) { p[i].bits = FloatToHalf(v); }
 
 /**
  * This is a utility structure for maintaining an array aligned to ALIGNMENT boundaries in
@@ -21,29 +105,95 @@ const size_t ELEM_SIZE = sizeof(scalar_t);
  * here by default.
  */
 struct AlignedArray {
-  AlignedArray(const size_t size) {
-    int ret = posix_memalign((void**)&ptr, ALIGNMENT, size * ELEM_SIZE);
+  AlignedArray(const size_t size, const std::string& dtype = "float32")
+      : dtype(ParseDType(dtype)), size(size) {
+    int ret = posix_memalign(&ptr, ALIGNMENT, std::max<size_t>(size, 1) * ElemSize(this->dtype));
     if (ret != 0) throw std::bad_alloc();
-    this->size = size;
   }
   ~AlignedArray() { free(ptr); }
-  size_t ptr_as_int() {return (size_t)ptr; }
-  scalar_t* ptr;
+  size_t ptr_as_int() { return (size_t)ptr; }
+  size_t itemsize() const { return ElemSize(dtype); }
+  std::string dtype_name() const { return DTypeName(dtype); }
+
+  template <typename T>
+  T* as() {
+    return static_cast<T*>(ptr);
+  }
+  template <typename T>
+  const T* as() const {
+    return static_cast<const T*>(ptr);
+  }
+
+  void* ptr;
+  DType dtype;
   size_t size;
 };
 
+/// Run `__VA_ARGS__` with `T` bound to the C++ element type of `dt`.
+#define NEEDLE_DISPATCH(dt, T, ...)    \
+  switch (dt) {                        \
+    case DType::F32: {                 \
+      typedef float T;                 \
+      __VA_ARGS__;                     \
+      break;                           \
+    }                                  \
+    case DType::F16: {                 \
+      typedef half_t T;                \
+      __VA_ARGS__;                     \
+      break;                           \
+    }                                  \
+  }
 
-
-void Fill(AlignedArray* out, scalar_t val) {
-  /**
-   * Fill the values of an aligned array with val
-   */
-  for (int i = 0; i < out->size; i++) {
-    out->ptr[i] = val;
+inline void CheckSameDType(const AlignedArray& a, const AlignedArray& b) {
+  if (a.dtype != b.dtype) {
+    throw std::invalid_argument(std::string("dtype mismatch: ") + a.dtype_name() + " vs " +
+                                b.dtype_name());
   }
 }
 
+void Fill(AlignedArray* out, float val) {
+  /**
+   * Fill the values of an aligned array with val
+   */
+  NEEDLE_DISPATCH(out->dtype, T, {
+    T* o = out->as<T>();
+    for (size_t i = 0; i < out->size; i++) Store(o, i, val);
+  });
+}
 
+void Cast(const AlignedArray& a, AlignedArray* out) {
+  /**
+   * Convert the (compact) array a into out, which has the same size but possibly another dtype.
+   */
+  if (a.size != out->size) throw std::invalid_argument("cast: size mismatch");
+  NEEDLE_DISPATCH(a.dtype, TI, {
+    NEEDLE_DISPATCH(out->dtype, TO, {
+      const TI* src = a.as<TI>();
+      TO* dst = out->as<TO>();
+      for (size_t i = 0; i < a.size; i++) Store(dst, i, Load(src, i));
+    });
+  });
+}
+
+/// Visit every element of a strided view (row-major order), calling f(compact_idx, strided_idx).
+template <typename F>
+void ForEachStrided(const std::vector<int32_t>& shape, const std::vector<int32_t>& strides,
+                    size_t offset, F f) {
+  int n = shape.size();
+  std::vector<int32_t> cur(n, 0);
+  size_t total = 1;
+  for (int i = 0; i < n; i++) total *= shape[i];
+  for (size_t i = 0; i < total; i++) {
+    int64_t index = offset;
+    for (int j = 0; j < n; j++) index += (int64_t)cur[j] * strides[j];
+    f(i, (size_t)index);
+    for (int j = n - 1; j >= 0; j--) {
+      cur[j]++;
+      if (cur[j] < shape[j]) break;
+      cur[j] = 0;
+    }
+  }
+}
 
 void Compact(const AlignedArray& a, AlignedArray* out, std::vector<int32_t> shape,
              std::vector<int32_t> strides, size_t offset) {
@@ -56,34 +206,13 @@ void Compact(const AlignedArray& a, AlignedArray* out, std::vector<int32_t> shap
    *   shape: shapes of each dimension for a and out
    *   strides: strides of the *a* array (not out, which has compact strides)
    *   offset: offset of the *a* array (not out, which has zero offset, being compact)
-   *
-   * Returns:
-   *  void (you need to modify out directly, rather than returning anything; this is true for all the
-   *  function will implement here, so we won't repeat this note.)
    */
-  /// BEGIN SOLUTION
-  // assert(false && "Not Implemented");
-  int n = shape.size();
-  std::vector<int32_t> cur(n,0); 
-  int total = 1; 
-  for(int i=0;i<n;i++){
-    total *= shape[i]; 
-  }
-  for(int i=0;i<total;i++){
-    int index = offset; 
-    for(int j=0;j<n;j++){
-      index += cur[j] * strides[j]; 
-    }
-    out->ptr[i] = a.ptr[index]; 
-    for (int j = n - 1; j >= 0; j--) {
-      cur[j]++;
-      if (cur[j] < shape[j]) {
-        break;
-      }
-      cur[j] = 0;
-    }
-  }
-  /// END SOLUTION
+  CheckSameDType(a, *out);
+  NEEDLE_DISPATCH(a.dtype, T, {
+    const T* src = a.as<T>();
+    T* dst = out->as<T>();
+    ForEachStrided(shape, strides, offset, [&](size_t i, size_t idx) { dst[i] = src[idx]; });
+  });
 }
 
 void EwiseSetitem(const AlignedArray& a, AlignedArray* out, std::vector<int32_t> shape,
@@ -98,32 +227,15 @@ void EwiseSetitem(const AlignedArray& a, AlignedArray* out, std::vector<int32_t>
    *   strides: strides of the *out* array (not a, which has compact strides)
    *   offset: offset of the *out* array (not a, which has zero offset, being compact)
    */
-  /// BEGIN SOLUTION
-  // assert(false && "Not Implemented");
-  int n = shape.size();
-  std::vector<int32_t> cur(n,0); 
-  int total = 1; 
-  for(int i=0;i<n;i++){
-    total *= shape[i]; 
-  }
-  for(int i=0;i<total;i++){
-    int index = offset; 
-    for(int j=0;j<n;j++){
-      index += cur[j] * strides[j]; 
-    }
-    out->ptr[index] = a.ptr[i]; 
-    for (int j = n - 1; j >= 0; j--) {
-      cur[j]++;
-      if (cur[j] < shape[j]) {
-        break;
-      }
-      cur[j] = 0;
-    }
-  }
-  /// END SOLUTION
+  CheckSameDType(a, *out);
+  NEEDLE_DISPATCH(a.dtype, T, {
+    const T* src = a.as<T>();
+    T* dst = out->as<T>();
+    ForEachStrided(shape, strides, offset, [&](size_t i, size_t idx) { dst[idx] = src[i]; });
+  });
 }
 
-void ScalarSetitem(const size_t size, scalar_t val, AlignedArray* out, std::vector<int32_t> shape,
+void ScalarSetitem(const size_t size, float val, AlignedArray* out, std::vector<int32_t> shape,
                    std::vector<int32_t> strides, size_t offset) {
   /**
    * Set items is a (non-compact) array
@@ -138,167 +250,107 @@ void ScalarSetitem(const size_t size, scalar_t val, AlignedArray* out, std::vect
    *   strides: strides of the out array
    *   offset: offset of the out array
    */
-
-  /// BEGIN SOLUTION
-  // assert(false && "Not Implemented");
-  int n = shape.size();
-  std::vector<int32_t> cur(n,0); 
-  int total = 1; 
-  for(int i=0;i<n;i++){
-    total *= shape[i]; 
-  }
-  for(int i=0;i<total;i++){
-    int index = offset; 
-    for(int j=0;j<n;j++){
-      index += cur[j] * strides[j]; 
-    }
-    out->ptr[index] = val; 
-    for (int j = n - 1; j >= 0; j--) {
-      cur[j]++;
-      if (cur[j] < shape[j]) {
-        break;
-      }
-      cur[j] = 0;
-    }
-  }
-  /// END SOLUTION
+  NEEDLE_DISPATCH(out->dtype, T, {
+    T* dst = out->as<T>();
+    ForEachStrided(shape, strides, offset, [&](size_t, size_t idx) { Store(dst, idx, val); });
+  });
 }
+
+/// Generic element-wise kernels; the arithmetic itself is always done in float.
+template <typename Op>
+void EwiseBinary(const AlignedArray& a, const AlignedArray& b, AlignedArray* out, Op op) {
+  CheckSameDType(a, b);
+  CheckSameDType(a, *out);
+  NEEDLE_DISPATCH(a.dtype, T, {
+    const T* pa = a.as<T>();
+    const T* pb = b.as<T>();
+    T* po = out->as<T>();
+    for (size_t i = 0; i < a.size; i++) Store(po, i, op(Load(pa, i), Load(pb, i)));
+  });
+}
+
+template <typename Op>
+void ScalarBinary(const AlignedArray& a, float val, AlignedArray* out, Op op) {
+  CheckSameDType(a, *out);
+  NEEDLE_DISPATCH(a.dtype, T, {
+    const T* pa = a.as<T>();
+    T* po = out->as<T>();
+    for (size_t i = 0; i < a.size; i++) Store(po, i, op(Load(pa, i), val));
+  });
+}
+
+template <typename Op>
+void EwiseUnary(const AlignedArray& a, AlignedArray* out, Op op) {
+  CheckSameDType(a, *out);
+  NEEDLE_DISPATCH(a.dtype, T, {
+    const T* pa = a.as<T>();
+    T* po = out->as<T>();
+    for (size_t i = 0; i < a.size; i++) Store(po, i, op(Load(pa, i)));
+  });
+}
+
+struct OpAdd { float operator()(float x, float y) const { return x + y; } };
+struct OpMul { float operator()(float x, float y) const { return x * y; } };
+struct OpDiv { float operator()(float x, float y) const { return x / y; } };
+struct OpPow { float operator()(float x, float y) const { return std::pow(x, y); } };
+struct OpMax { float operator()(float x, float y) const { return std::max(x, y); } };
+struct OpEq { float operator()(float x, float y) const { return (float)(x == y); } };
+struct OpGe { float operator()(float x, float y) const { return (float)(x >= y); } };
+struct OpLog { float operator()(float x) const { return std::log(x); } };
+struct OpExp { float operator()(float x) const { return std::exp(x); } };
+struct OpTanh { float operator()(float x) const { return std::tanh(x); } };
 
 void EwiseAdd(const AlignedArray& a, const AlignedArray& b, AlignedArray* out) {
-  /**
-   * Set entries in out to be the sum of correspondings entires in a and b.
-   */
-  for (size_t i = 0; i < a.size; i++) {
-    out->ptr[i] = a.ptr[i] + b.ptr[i];
-  }
+  EwiseBinary(a, b, out, OpAdd());
 }
-
-void ScalarAdd(const AlignedArray& a, scalar_t val, AlignedArray* out) {
-  /**
-   * Set entries in out to be the sum of corresponding entry in a plus the scalar val.
-   */
-  for (size_t i = 0; i < a.size; i++) {
-    out->ptr[i] = a.ptr[i] + val;
-  }
+void ScalarAdd(const AlignedArray& a, float val, AlignedArray* out) {
+  ScalarBinary(a, val, out, OpAdd());
 }
-
-
-/**
- * In the code the follows, use the above template to create analogous element-wise
- * and and scalar operators for the following functions.  See the numpy backend for
- * examples of how they should work.
- *   - EwiseMul, ScalarMul
- *   - EwiseDiv, ScalarDiv
- *   - ScalarPower
- *   - EwiseMaximum, ScalarMaximum
- *   - EwiseEq, ScalarEq
- *   - EwiseGe, ScalarGe
- *   - EwiseLog
- *   - EwiseExp
- *   - EwiseTanh
- *
- * If you implement all these naively, there will be a lot of repeated code, so
- * you are welcome (but not required), to use macros or templates to define these
- * functions (however you want to do so, as long as the functions match the proper)
- * signatures above.
- */
-
 void EwiseMul(const AlignedArray& a, const AlignedArray& b, AlignedArray* out) {
-  for (size_t i = 0; i < a.size; i++) {
-    out->ptr[i] = a.ptr[i] * b.ptr[i];
-  }
+  EwiseBinary(a, b, out, OpMul());
 }
-
-void ScalarMul(const AlignedArray& a, scalar_t val, AlignedArray* out) {
-  for (size_t i = 0; i < a.size; i++) {
-    out->ptr[i] = a.ptr[i] * val;
-  }
+void ScalarMul(const AlignedArray& a, float val, AlignedArray* out) {
+  ScalarBinary(a, val, out, OpMul());
 }
-
 void EwiseDiv(const AlignedArray& a, const AlignedArray& b, AlignedArray* out) {
-  for (size_t i = 0; i < a.size; i++) {
-    out->ptr[i] = a.ptr[i] / b.ptr[i];
-  }
+  EwiseBinary(a, b, out, OpDiv());
 }
-
-void ScalarDiv(const AlignedArray& a, scalar_t val, AlignedArray* out) {
-  for (size_t i = 0; i < a.size; i++) {
-    out->ptr[i] = a.ptr[i] / val;
-  }
+void ScalarDiv(const AlignedArray& a, float val, AlignedArray* out) {
+  ScalarBinary(a, val, out, OpDiv());
 }
-
-void ScalarPower(const AlignedArray& a, scalar_t val, AlignedArray* out) {
-  for (size_t i = 0; i < a.size; i++) {
-    out->ptr[i] = (scalar_t) std::pow(a.ptr[i], val);
-  }
-}
-
 void EwisePower(const AlignedArray& a, const AlignedArray& b, AlignedArray* out) {
-  for (size_t i = 0; i < a.size; i++) {
-    out->ptr[i] = (scalar_t) std::pow(a.ptr[i], b.ptr[i]);
-  }
+  EwiseBinary(a, b, out, OpPow());
 }
-
+void ScalarPower(const AlignedArray& a, float val, AlignedArray* out) {
+  ScalarBinary(a, val, out, OpPow());
+}
 void EwiseMaximum(const AlignedArray& a, const AlignedArray& b, AlignedArray* out) {
-  for (size_t i = 0; i < a.size; i++) {
-    out->ptr[i] = std::max(a.ptr[i], b.ptr[i]);
-  }
+  EwiseBinary(a, b, out, OpMax());
 }
-
-void ScalarMaximum(const AlignedArray& a, scalar_t val, AlignedArray* out) {
-  for (size_t i = 0; i < a.size; i++) {
-    out->ptr[i] = std::max(a.ptr[i], val);
-  }
+void ScalarMaximum(const AlignedArray& a, float val, AlignedArray* out) {
+  ScalarBinary(a, val, out, OpMax());
 }
-
 void EwiseEq(const AlignedArray& a, const AlignedArray& b, AlignedArray* out) {
-  for (size_t i = 0; i < a.size; i++) {
-    out->ptr[i] = (scalar_t) (a.ptr[i] == b.ptr[i]);
-  }
+  EwiseBinary(a, b, out, OpEq());
 }
-
-void ScalarEq(const AlignedArray& a, scalar_t val, AlignedArray* out) {
-  for (size_t i = 0; i < a.size; i++) {
-    out->ptr[i] = (scalar_t) (a.ptr[i] == val);
-  }
+void ScalarEq(const AlignedArray& a, float val, AlignedArray* out) {
+  ScalarBinary(a, val, out, OpEq());
 }
-
 void EwiseGe(const AlignedArray& a, const AlignedArray& b, AlignedArray* out) {
-  for (size_t i = 0; i < a.size; i++) {
-    out->ptr[i] = (scalar_t) (a.ptr[i] >= b.ptr[i]);
-  }
+  EwiseBinary(a, b, out, OpGe());
 }
-
-void ScalarGe(const AlignedArray& a, scalar_t val, AlignedArray* out) {
-  for (size_t i = 0; i < a.size; i++) {
-    out->ptr[i] = (scalar_t) (a.ptr[i] >= val);
-  }
+void ScalarGe(const AlignedArray& a, float val, AlignedArray* out) {
+  ScalarBinary(a, val, out, OpGe());
 }
-
-void EwiseLog(const AlignedArray& a, AlignedArray* out) {
-  for (size_t i = 0; i < a.size; i++) {
-    out->ptr[i] = (scalar_t) (std::log(a.ptr[i])); 
-  }
-}
-
-void EwiseExp(const AlignedArray& a, AlignedArray* out) {
-  for (size_t i = 0; i < a.size; i++) {
-    out->ptr[i] = (scalar_t) (std::exp(a.ptr[i])); 
-  }
-}
-
-void EwiseTanh(const AlignedArray& a, AlignedArray* out) {
-  for (size_t i = 0; i < a.size; i++) {
-    out->ptr[i] = (scalar_t) (std::tanh(a.ptr[i])); 
-  }
-}
-
+void EwiseLog(const AlignedArray& a, AlignedArray* out) { EwiseUnary(a, out, OpLog()); }
+void EwiseExp(const AlignedArray& a, AlignedArray* out) { EwiseUnary(a, out, OpExp()); }
+void EwiseTanh(const AlignedArray& a, AlignedArray* out) { EwiseUnary(a, out, OpTanh()); }
 
 void Matmul(const AlignedArray& a, const AlignedArray& b, AlignedArray* out, uint32_t m, uint32_t n,
             uint32_t p) {
   /**
-   * Multiply two (compact) matrices into an output (also compact) matrix.  For this implementation
-   * you can use the "naive" three-loop algorithm.
+   * Multiply two (compact) matrices into an output (also compact) matrix, using the naive
+   * three-loop algorithm. Accumulation is always done in float32.
    *
    * Args:
    *   a: compact 2D array of size m x n
@@ -308,19 +360,22 @@ void Matmul(const AlignedArray& a, const AlignedArray& b, AlignedArray* out, uin
    *   n: columns of a / rows of b
    *   p: columns of b / out
    */
-
-  /// BEGIN SOLUTION
-  // assert(false && "Not Implemented");
-  for(size_t i=0;i<m;i++){
-    for(size_t j=0;j<p;j++){
-      scalar_t tmp = 0; 
-      for(size_t k=0;k<n;k++){
-        tmp += a.ptr[i*n+k] * b.ptr[k*p+j]; 
+  CheckSameDType(a, b);
+  CheckSameDType(a, *out);
+  NEEDLE_DISPATCH(a.dtype, T, {
+    const T* pa = a.as<T>();
+    const T* pb = b.as<T>();
+    T* po = out->as<T>();
+    for (size_t i = 0; i < m; i++) {
+      for (size_t j = 0; j < p; j++) {
+        float tmp = 0;
+        for (size_t k = 0; k < n; k++) {
+          tmp += Load(pa, i * n + k) * Load(pb, k * p + j);
+        }
+        Store(po, i * p + j, tmp);
       }
-      out->ptr[i*p+j] = tmp; 
     }
-  }
-  /// END SOLUTION
+  });
 }
 
 inline void AlignedDot(const float* __restrict__ a,
@@ -344,21 +399,18 @@ inline void AlignedDot(const float* __restrict__ a,
    *   out: compact 2D array of size TILE x TILE to write to
    */
 
-  a = (const float*)__builtin_assume_aligned(a, TILE * ELEM_SIZE);
-  b = (const float*)__builtin_assume_aligned(b, TILE * ELEM_SIZE);
-  out = (float*)__builtin_assume_aligned(out, TILE * ELEM_SIZE);
+  a = (const float*)__builtin_assume_aligned(a, TILE * sizeof(float));
+  b = (const float*)__builtin_assume_aligned(b, TILE * sizeof(float));
+  out = (float*)__builtin_assume_aligned(out, TILE * sizeof(float));
 
-  /// BEGIN SOLUTION
-  // assert(false && "Not Implemented");
-  for(size_t i=0;i<TILE;i++){
-    for(size_t k=0;k<TILE;k++){
-      float a_ik = a[i*TILE+k]; 
-      for(size_t j=0;j<TILE;j++){
-        out[i*TILE+j] += a_ik * b[k*TILE+j]; 
+  for (size_t i = 0; i < TILE; i++) {
+    for (size_t k = 0; k < TILE; k++) {
+      float a_ik = a[i * TILE + k];
+      for (size_t j = 0; j < TILE; j++) {
+        out[i * TILE + j] += a_ik * b[k * TILE + j];
       }
     }
   }
-  /// END SOLUTION
 }
 
 void MatmulTiled(const AlignedArray& a, const AlignedArray& b, AlignedArray* out, uint32_t m,
@@ -367,11 +419,11 @@ void MatmulTiled(const AlignedArray& a, const AlignedArray& b, AlignedArray* out
    * Matrix multiplication on tiled representations of array.  In this setting, a, b, and out
    * are all *4D* compact arrays of the appropriate size, e.g. a is an array of size
    *   a[m/TILE][n/TILE][TILE][TILE]
-   * You should do the multiplication tile-by-tile to improve performance of the array (i.e., this
-   * function should call `AlignedDot()` implemented above).
+   * The multiplication is done tile-by-tile with AlignedDot(). Only called when m, n, p are all
+   * multiples of TILE.
    *
-   * Note that this function will only be called when m, n, p are all multiples of TILE, so you can
-   * assume that this division happens without any remainder.
+   * For float32 the tiles are used in place. For float16 each tile is widened into an aligned
+   * float32 buffer and every output tile is accumulated in float32 before being rounded once.
    *
    * Args:
    *   a: compact 4D array of size m/TILE x n/TILE x TILE x TILE
@@ -380,19 +432,50 @@ void MatmulTiled(const AlignedArray& a, const AlignedArray& b, AlignedArray* out
    *   m: rows of a / out
    *   n: columns of a / rows of b
    *   p: columns of b / out
-   *
    */
-  /// BEGIN SOLUTION
-  // assert(false && "Not Implemented");
-  Fill(out, 0.0f);
-  for(size_t i=0;i<m/TILE;i++){
-    for(size_t j=0;j<p/TILE;j++){
-      for(size_t k=0;k<n/TILE;k++){
-        AlignedDot(a.ptr+i*n*TILE+k*TILE*TILE, b.ptr+k*p*TILE+j*TILE*TILE, out->ptr+i*p*TILE+j*TILE*TILE); 
+  CheckSameDType(a, b);
+  CheckSameDType(a, *out);
+  const size_t TT = TILE * TILE;
+  if (a.dtype == DType::F32) {
+    const float* pa = a.as<float>();
+    const float* pb = b.as<float>();
+    float* po = out->as<float>();
+    Fill(out, 0.0f);
+    for (size_t i = 0; i < m / TILE; i++) {
+      for (size_t j = 0; j < p / TILE; j++) {
+        for (size_t k = 0; k < n / TILE; k++) {
+          AlignedDot(pa + i * n * TILE + k * TT, pb + k * p * TILE + j * TT,
+                     po + i * p * TILE + j * TT);
+        }
       }
     }
+    return;
   }
-  /// END SOLUTION
+
+  NEEDLE_DISPATCH(a.dtype, T, {
+    const T* pa = a.as<T>();
+    const T* pb = b.as<T>();
+    T* po = out->as<T>();
+    alignas(ALIGNMENT) float at[TT];
+    alignas(ALIGNMENT) float bt[TT];
+    alignas(ALIGNMENT) float acc[TT];
+    for (size_t i = 0; i < m / TILE; i++) {
+      for (size_t j = 0; j < p / TILE; j++) {
+        std::fill(acc, acc + TT, 0.0f);
+        for (size_t k = 0; k < n / TILE; k++) {
+          const size_t a_off = i * n * TILE + k * TT;
+          const size_t b_off = k * p * TILE + j * TT;
+          for (size_t t = 0; t < TT; t++) {
+            at[t] = Load(pa, a_off + t);
+            bt[t] = Load(pb, b_off + t);
+          }
+          AlignedDot(at, bt, acc);
+        }
+        const size_t o_off = i * p * TILE + j * TT;
+        for (size_t t = 0; t < TT; t++) Store(po, o_off + t, acc[t]);
+      }
+    }
+  });
 }
 
 void ReduceMax(const AlignedArray& a, AlignedArray* out, size_t reduce_size) {
@@ -404,39 +487,41 @@ void ReduceMax(const AlignedArray& a, AlignedArray* out, size_t reduce_size) {
    *   out: compact array to write into
    *   reduce_size: size of the dimension to reduce over
    */
-
-  /// BEGIN SOLUTION
-  // assert(false && "Not Implemented");
-  for(size_t outer=0; outer < out->size; outer++){
-    scalar_t tmp = a.ptr[reduce_size * outer]; 
-    for(size_t inner=1; inner < reduce_size; inner++){
-      tmp = std::max(a.ptr[inner + reduce_size * outer], tmp);
+  CheckSameDType(a, *out);
+  NEEDLE_DISPATCH(a.dtype, T, {
+    const T* pa = a.as<T>();
+    T* po = out->as<T>();
+    for (size_t outer = 0; outer < out->size; outer++) {
+      float tmp = Load(pa, reduce_size * outer);
+      for (size_t inner = 1; inner < reduce_size; inner++) {
+        tmp = std::max(Load(pa, inner + reduce_size * outer), tmp);
+      }
+      Store(po, outer, tmp);
     }
-    out->ptr[outer] = tmp; 
-  }
-  /// END SOLUTION
+  });
 }
 
 void ReduceSum(const AlignedArray& a, AlignedArray* out, size_t reduce_size) {
   /**
-   * Reduce by taking sum over `reduce_size` contiguous blocks.
+   * Reduce by taking sum over `reduce_size` contiguous blocks. Accumulates in float32.
    *
    * Args:
    *   a: compact array of size a.size = out.size * reduce_size to reduce over
    *   out: compact array to write into
    *   reduce_size: size of the dimension to reduce over
    */
-
-  /// BEGIN SOLUTION
-  // assert(false && "Not Implemented");
-  for(size_t outer=0; outer < out->size; outer++){
-    scalar_t tmp = a.ptr[reduce_size * outer]; 
-    for(size_t inner=1; inner < reduce_size; inner++){
-      tmp += a.ptr[inner + reduce_size * outer];
+  CheckSameDType(a, *out);
+  NEEDLE_DISPATCH(a.dtype, T, {
+    const T* pa = a.as<T>();
+    T* po = out->as<T>();
+    for (size_t outer = 0; outer < out->size; outer++) {
+      float tmp = Load(pa, reduce_size * outer);
+      for (size_t inner = 1; inner < reduce_size; inner++) {
+        tmp += Load(pa, inner + reduce_size * outer);
+      }
+      Store(po, outer, tmp);
     }
-    out->ptr[outer] = tmp; 
-  }
-  /// END SOLUTION
+  });
 }
 
 }  // namespace cpu
@@ -449,28 +534,43 @@ PYBIND11_MODULE(ndarray_backend_cpu, m) {
 
   m.attr("__device_name__") = "cpu";
   m.attr("__tile_size__") = TILE;
+  m.attr("__dtypes__") = py::make_tuple("float32", "float16");
 
   py::class_<AlignedArray>(m, "Array")
-      .def(py::init<size_t>(), py::return_value_policy::take_ownership)
+      .def(py::init<size_t, std::string>(), py::arg("size"), py::arg("dtype") = "float32",
+           py::return_value_policy::take_ownership)
       .def("ptr", &AlignedArray::ptr_as_int)
-      .def_readonly("size", &AlignedArray::size);
+      .def_readonly("size", &AlignedArray::size)
+      .def_property_readonly("dtype", &AlignedArray::dtype_name)
+      .def_property_readonly("itemsize", &AlignedArray::itemsize);
 
   // return numpy array (with copying for simplicity, otherwise garbage
   // collection is a pain)
   m.def("to_numpy", [](const AlignedArray& a, std::vector<size_t> shape,
                        std::vector<size_t> strides, size_t offset) {
+    const size_t elem = a.itemsize();
     std::vector<size_t> numpy_strides = strides;
     std::transform(numpy_strides.begin(), numpy_strides.end(), numpy_strides.begin(),
-                   [](size_t& c) { return c * ELEM_SIZE; });
-    return py::array_t<scalar_t>(shape, numpy_strides, a.ptr + offset);
+                   [elem](size_t& c) { return c * elem; });
+    const char* base = static_cast<const char*>(a.ptr) + offset * elem;
+    return py::array(py::dtype(a.dtype_name()), shape, numpy_strides, base);
   });
 
-  // convert from numpy (with copying)
-  m.def("from_numpy", [](py::array_t<scalar_t> a, AlignedArray* out) {
-    std::memcpy(out->ptr, a.request().ptr, out->size * ELEM_SIZE);
+  // convert from numpy (with copying); the array must be C-contiguous with out's dtype
+  m.def("from_numpy", [](py::array a, AlignedArray* out) {
+    if (std::string(py::str(a.dtype())) != out->dtype_name()) {
+      throw std::invalid_argument("from_numpy: expected " + out->dtype_name() + " array, got " +
+                                  std::string(py::str(a.dtype())));
+    }
+    if (!(a.flags() & py::array::c_style)) {
+      throw std::invalid_argument("from_numpy: array must be C-contiguous");
+    }
+    if ((size_t)a.size() != out->size) throw std::invalid_argument("from_numpy: size mismatch");
+    std::memcpy(out->ptr, a.data(), out->size * out->itemsize());
   });
 
   m.def("fill", Fill);
+  m.def("cast", Cast);
   m.def("compact", Compact);
   m.def("ewise_setitem", EwiseSetitem);
   m.def("scalar_setitem", ScalarSetitem);

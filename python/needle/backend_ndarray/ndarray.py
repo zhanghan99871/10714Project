@@ -14,6 +14,22 @@ def prod(x: Iterable[int]) -> int:
     return reduce(operator.mul, x, 1)
 
 
+# Element types NDArray knows about. A backend advertises what it implements through a
+# module-level ``__dtypes__`` tuple; backends without it (e.g. the numpy backend) are
+# float32-only. float16 is a storage type: the native backends compute in float32.
+SUPPORTED_DTYPES = ("float32", "float16")
+
+
+def normalize_dtype(dtype: Any) -> str:
+    """Canonical dtype name ("float32" / "float16"); None means float32."""
+    if dtype is None:
+        return "float32"
+    name = np.dtype(dtype).name
+    if name not in SUPPORTED_DTYPES:
+        raise TypeError(f"unsupported dtype {dtype!r}; expected one of {SUPPORTED_DTYPES}")
+    return name
+
+
 class BackendDevice:
     """A backend device, wrapps the implementation module."""
 
@@ -33,27 +49,31 @@ class BackendDevice:
     def enabled(self) -> bool:
         return self.mod is not None
 
+    @property
+    def dtypes(self) -> tuple[str, ...]:
+        """dtypes this backend can store."""
+        return tuple(getattr(self.mod, "__dtypes__", ("float32",)))
+
+    def supports_dtype(self, dtype: Any) -> bool:
+        return normalize_dtype(dtype) in self.dtypes
+
     def randn(self, *shape: int, dtype: str = "float32") -> "NDArray":
         # note: numpy doesn't support types within standard random routines, and
         # .astype("float32") does work if we're generating a singleton
-        return NDArray(np.random.randn(*shape).astype(dtype), device=self)
+        return NDArray(np.random.randn(*shape).astype(dtype), device=self, dtype=dtype)
 
     def rand(self, *shape: int, dtype: str = "float32") -> "NDArray":
         # note: numpy doesn't support types within standard random routines, and
         # .astype("float32") does work if we're generating a singleton
-        return NDArray(np.random.rand(*shape).astype(dtype), device=self)
+        return NDArray(np.random.rand(*shape).astype(dtype), device=self, dtype=dtype)
 
     def one_hot(self, n: int, i: int, dtype: str = "float32") -> "NDArray":
-        return NDArray(np.eye(n, dtype=dtype)[i], device=self)
+        return NDArray(np.eye(n, dtype=dtype)[i], device=self, dtype=dtype)
 
     def empty(self, shape: tuple[int, ...], dtype: str = "float32") -> "NDArray":
-        dtype = "float32" if dtype is None else dtype
-        assert dtype == "float32"
-        return NDArray.make(shape, device=self)
+        return NDArray.make(shape, device=self, dtype=dtype)
 
     def full(self, shape: tuple[int, ...], fill_value: float, dtype: str = "float32") -> "NDArray":
-        dtype = "float32" if dtype is None else dtype
-        assert dtype == "float32"
         arr = self.empty(shape, dtype)
         arr.fill(fill_value)
         return arr
@@ -96,8 +116,10 @@ class NDArray:
     to actually get the desired functionality for the programming examples
     in the homework, and no more.
 
-    For now, for simplicity the class only supports float32 types, though
-    this can be extended if desired.
+    Supported element types are float32 and float16 (see SUPPORTED_DTYPES). float16
+    arrays are stored in 16 bits but computed in float32 by the native backends
+    (including float32 accumulation in matmul and reductions). Binary operations
+    require both operands to have the same dtype; use astype() to convert.
     """
 
     _shape: tuple[int, ...]
@@ -105,23 +127,32 @@ class NDArray:
     _offset: int
     _device: BackendDevice
     _handle: Any
+    _dtype: str
 
-    def __init__(self, other, device=None):
-        """Create by copying another NDArray, or from numpy"""
+    def __init__(self, other, device=None, dtype=None):
+        """Create by copying another NDArray, or from numpy.
+
+        dtype=None keeps the dtype of an NDArray input; for numpy input it keeps
+        float16 and converts everything else to float32 (the previous behaviour).
+        """
         if isinstance(other, NDArray):
             # create a copy of existing NDArray
             if device is None:
                 device = other.device
-            self._init(other.to(device) + 0.0)  # this creates a copy
+            dtype = other.dtype if dtype is None else normalize_dtype(dtype)
+            self._init(other.to(device).astype(dtype, copy=True))
         elif isinstance(other, np.ndarray):
             # create copy from numpy array
             device = device if device is not None else default_device()
-            array = self.make(other.shape, device=device)
-            array.device.from_numpy(np.ascontiguousarray(other), array._handle)
+            if dtype is None:
+                dtype = "float16" if other.dtype == np.float16 else "float32"
+            dtype = normalize_dtype(dtype)
+            array = self.make(other.shape, device=device, dtype=dtype)
+            array.device.from_numpy(np.ascontiguousarray(other, dtype=dtype), array._handle)
             self._init(array)
         else:
             # see if we can create a numpy array from input
-            array = NDArray(np.array(other), device=device)
+            array = NDArray(np.array(other), device=device, dtype=dtype)
             self._init(array)
 
     def _init(self, other: "NDArray") -> None:
@@ -130,6 +161,7 @@ class NDArray:
         self._offset = other._offset
         self._device = other._device
         self._handle = other._handle
+        self._dtype = other._dtype
 
     @staticmethod
     def compact_strides(shape: tuple[int, ...]) -> tuple[int, ...]:
@@ -148,19 +180,32 @@ class NDArray:
         device: BackendDevice | None = None,
         handle: Any = None,
         offset: int = 0,
+        dtype: str | None = None,
     ) -> "NDArray":
         """Create a new NDArray with the given properties.  This will allocation the
         memory if handle=None, otherwise it will use the handle of an existing
-        array."""
+        array (whose dtype then wins over the `dtype` argument)."""
         array = NDArray.__new__(NDArray)
         array._shape = tuple(shape)
         array._strides = NDArray.compact_strides(shape) if strides is None else strides
         array._offset = offset
         array._device = device if device is not None else default_device()
         if handle is None:
-            array._handle = array.device.Array(prod(shape))
+            dtype = normalize_dtype(dtype)
+            if dtype == "float32":
+                # keep the one-argument call so float32-only backends keep working
+                array._handle = array.device.Array(prod(shape))
+            elif array.device.supports_dtype(dtype):
+                array._handle = array.device.Array(prod(shape), dtype)
+            else:
+                raise TypeError(
+                    f"{array.device} backend does not support dtype {dtype} "
+                    f"(supported: {array.device.dtypes})"
+                )
+            array._dtype = dtype
         else:
             array._handle = handle
+            array._dtype = getattr(handle, "dtype", "float32")
         return array
 
     ### Properies and string representations
@@ -178,8 +223,11 @@ class NDArray:
 
     @property
     def dtype(self) -> str:
-        # only support float32 for now
-        return "float32"
+        return self._dtype
+
+    @property
+    def itemsize(self) -> int:
+        return np.dtype(self._dtype).itemsize
 
     @property
     def ndim(self) -> int:
@@ -191,7 +239,8 @@ class NDArray:
         return prod(self._shape)
 
     def __repr__(self) -> str:
-        return "NDArray(" + self.numpy().__str__() + f", device={self.device})"
+        dtype = "" if self.dtype == "float32" else f", dtype={self.dtype}"
+        return "NDArray(" + self.numpy().__str__() + f", device={self.device}{dtype})"
 
     def __str__(self) -> str:
         return self.numpy().__str__()
@@ -207,6 +256,22 @@ class NDArray:
             return self
         else:
             return NDArray(self.numpy(), device=device)
+
+    def astype(self, dtype: Any, copy: bool = True) -> "NDArray":
+        """Convert to another element type (float32 <-> float16).
+
+        float32 -> float16 rounds to nearest even, like numpy. With copy=False an
+        array that already has the requested dtype is returned as is.
+        """
+        dtype = normalize_dtype(dtype)
+        if dtype == self.dtype and not copy:
+            return self
+        if not hasattr(self.device.mod, "cast"):
+            # backend without a cast kernel (numpy backend): go through numpy
+            return NDArray(self.numpy(), device=self.device, dtype=dtype)
+        out = NDArray.make(self.shape, device=self.device, dtype=dtype)
+        self.device.cast(self.compact()._handle, out._handle)
+        return out
 
     def numpy(self) -> np.ndarray:
         """convert to a numpy array"""
@@ -227,7 +292,7 @@ class NDArray:
         if self.is_compact():
             return self
         else:
-            out = NDArray.make(self.shape, device=self.device)
+            out = NDArray.make(self.shape, device=self.device, dtype=self.dtype)
             self.device.compact(
                 self._handle, out._handle, self.shape, self.strides, self._offset
             )
@@ -417,6 +482,8 @@ class NDArray:
         view = self.__getitem__(idxs)
         if isinstance(other, NDArray):
             assert prod(view.shape) == prod(other.shape)
+            if other.dtype != self.dtype:
+                other = other.astype(self.dtype)  # assignment casts, like numpy
             self.device.ewise_setitem(
                 other.compact()._handle,
                 view._handle,
@@ -445,9 +512,13 @@ class NDArray:
         """Run either an elementwise or scalar version of a function,
         depending on whether "other" is an NDArray or scalar
         """
-        out = NDArray.make(self.shape, device=self.device)
+        out = NDArray.make(self.shape, device=self.device, dtype=self.dtype)
         if isinstance(other, NDArray):
             assert self.shape == other.shape, "operation needs two equal-sized arrays"
+            assert self.dtype == other.dtype, (
+                f"operation needs two arrays of the same dtype, got {self.dtype} and "
+                f"{other.dtype}; use astype() to convert"
+            )
             ewise_func(self.compact()._handle, other.compact()._handle, out._handle)
         else:
             scalar_func(self.compact()._handle, other, out._handle)
@@ -482,11 +553,14 @@ class NDArray:
         return self * (-1)
 
     def __pow__(self, other: Union["NDArray", float]) -> "NDArray":
-        out = NDArray.make(self.shape, device=self.device)
+        out = NDArray.make(self.shape, device=self.device, dtype=self.dtype)
         if isinstance(other, NDArray):
             # Only the tensor-exponent path needs the ewise_power kernel, so
             # scalar powers keep working on backends built without it.
             assert self.shape == other.shape, "operation needs two equal-sized arrays"
+            assert self.dtype == other.dtype, (
+                f"operation needs two arrays of the same dtype, got {self.dtype} and {other.dtype}"
+            )
             if not hasattr(self.device.mod, "ewise_power"):
                 raise RuntimeError(
                     f"{self.device} backend has no ewise_power; rebuild the "
@@ -526,17 +600,17 @@ class NDArray:
     ### Elementwise functions
 
     def log(self) -> "NDArray":
-        out = NDArray.make(self.shape, device=self.device)
+        out = NDArray.make(self.shape, device=self.device, dtype=self.dtype)
         self.device.ewise_log(self.compact()._handle, out._handle)
         return out
 
     def exp(self) -> "NDArray":
-        out = NDArray.make(self.shape, device=self.device)
+        out = NDArray.make(self.shape, device=self.device, dtype=self.dtype)
         self.device.ewise_exp(self.compact()._handle, out._handle)
         return out
 
     def tanh(self) -> "NDArray":
-        out = NDArray.make(self.shape, device=self.device)
+        out = NDArray.make(self.shape, device=self.device, dtype=self.dtype)
         self.device.ewise_tanh(self.compact()._handle, out._handle)
         return out
 
@@ -560,6 +634,9 @@ class NDArray:
 
         assert self.ndim == 2 and other.ndim == 2
         assert self.shape[1] == other.shape[0]
+        assert self.dtype == other.dtype, (
+            f"matmul needs two arrays of the same dtype, got {self.dtype} and {other.dtype}"
+        )
 
         m, n, p = self.shape[0], self.shape[1], other.shape[1]
 
@@ -577,7 +654,7 @@ class NDArray:
             t = self.device.__tile_size__
             a = tile(self.compact(), t).compact()
             b = tile(other.compact(), t).compact()
-            out = NDArray.make((a.shape[0], b.shape[1], t, t), device=self.device)
+            out = NDArray.make((a.shape[0], b.shape[1], t, t), device=self.device, dtype=self.dtype)
             self.device.matmul_tiled(a._handle, b._handle, out._handle, m, n, p)
 
             return (
@@ -587,7 +664,7 @@ class NDArray:
             )
 
         else:
-            out = NDArray.make((m, p), device=self.device)
+            out = NDArray.make((m, p), device=self.device, dtype=self.dtype)
             self.device.matmul(
                 self.compact()._handle, other.compact()._handle, out._handle, m, n, p
             )
@@ -602,7 +679,7 @@ class NDArray:
         if axis is None:
             view = self.compact().reshape((1,) * (self.ndim - 1) + (prod(self.shape),))
             #out = NDArray.make((1,) * self.ndim, device=self.device)
-            out = NDArray.make((1,), device=self.device)
+            out = NDArray.make((1,), device=self.device, dtype=self.dtype)
 
         else:
             if isinstance(axis, (tuple, list)):
@@ -617,10 +694,22 @@ class NDArray:
                 if keepdims else
                 tuple([s for i, s in enumerate(self.shape) if i != axis]),
                 device=self.device,
+                dtype=self.dtype,
             )
         return view, out
 
-    def sum(self, axis: int | tuple[int, ...] | list[int] | None = None, keepdims: bool = False) -> "NDArray":
+    def sum(
+        self,
+        axis: int | tuple[int, ...] | list[int] | None = None,
+        keepdims: bool = False,
+        dtype: Any = None,
+    ) -> "NDArray":
+        """Sum over `axis`. The backends always accumulate in float32; `dtype`
+        selects the *output* type, e.g. sum(dtype="float32") on a float16 array
+        returns the float32 total instead of rounding it (and possibly
+        overflowing past 65504) back to float16."""
+        if dtype is not None and normalize_dtype(dtype) != self.dtype:
+            return self.astype(dtype).sum(axis=axis, keepdims=keepdims)
         view, out = self.reduce_view_out(axis, keepdims=keepdims)
         self.device.reduce_sum(view.compact()._handle, out._handle, view.shape[-1])
         return out
@@ -629,6 +718,22 @@ class NDArray:
         view, out = self.reduce_view_out(axis, keepdims=keepdims)
         self.device.reduce_max(view.compact()._handle, out._handle, view.shape[-1])
         return out
+
+    ### Overflow checks (used by mixed precision loss scaling)
+    def isfinite(self) -> "NDArray":
+        """1.0 where the element is finite, 0.0 where it is inf or NaN (same dtype).
+
+        Uses x - x, which is 0 for finite x and NaN for inf / NaN, so it runs on
+        the device without new kernels.
+        """
+        return (self - self) == 0
+
+    def all_finite(self) -> bool:
+        """True if no element is inf or NaN. Transfers a single scalar to the host."""
+        if self.size == 0:
+            return True
+        # sum(x - x) is exactly 0 iff every element is finite; NaN otherwise
+        return bool(self.__sub__(self).sum(dtype="float32").numpy().item() == 0)
 
     def flip(self, axes: tuple[int, ...]) -> "NDArray":
         """
@@ -658,18 +763,20 @@ class NDArray:
         # raise NotImplementedError()
         ori_shape = self.shape
         new_shape = tuple([ori_shape[i] + axes[i][0] + axes[i][1] for i in range(len(ori_shape))])
-        result = NDArray.make(new_shape, device=self.device) 
+        result = NDArray.make(new_shape, device=self.device, dtype=self.dtype)
         result.fill(0.0)
         copy_slice = tuple([slice(axes[i][0], axes[i][0] + ori_shape[i]) for i in range(len(ori_shape))])
         result[copy_slice] = self
         return result 
         ### END YOUR SOLUTION
 
-def array(a: Any, dtype: str = "float32", device: BackendDevice | None = None) -> NDArray:
-    """Convenience methods to match numpy a bit more closely."""
-    dtype = "float32" if dtype is None else dtype
-    assert dtype == "float32"
-    return NDArray(a, device=device)
+def array(a: Any, dtype: str | None = None, device: BackendDevice | None = None) -> NDArray:
+    """Convenience methods to match numpy a bit more closely.
+
+    dtype=None keeps an NDArray's dtype and a numpy float16 array's dtype, and
+    otherwise produces float32.
+    """
+    return NDArray(a, device=device, dtype=dtype)
 
 
 def empty(shape: tuple[int, ...], dtype: str = "float32", device: BackendDevice | None = None) -> NDArray:
@@ -706,8 +813,25 @@ def tanh(a: NDArray) -> NDArray:
     return a.tanh()
 
 
-def sum(a: NDArray, axis: int | tuple[int] | list[int] | None = None, keepdims: bool = False) -> NDArray:
-    return a.sum(axis=axis, keepdims=keepdims)
+def sum(
+    a: NDArray,
+    axis: int | tuple[int] | list[int] | None = None,
+    keepdims: bool = False,
+    dtype: Any = None,
+) -> NDArray:
+    return a.sum(axis=axis, keepdims=keepdims, dtype=dtype)
+
+
+def astype(a: NDArray, dtype: Any, copy: bool = True) -> NDArray:
+    return a.astype(dtype, copy=copy)
+
+
+def isfinite(a: NDArray) -> NDArray:
+    return a.isfinite()
+
+
+def all_finite(a: NDArray) -> bool:
+    return a.all_finite()
 
 
 def flip(a: NDArray, axes: tuple[int, ...]) -> NDArray:
