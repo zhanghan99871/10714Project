@@ -74,14 +74,17 @@ class EWisePow(TensorOp):
     def compute(self, a: NDArray, b: NDArray) -> NDArray:
         ### BEGIN YOUR SOLUTION
         # raise NotImplementedError()
-        return array_api.exp(b * array_api.log(a))
+        # Direct elementwise power, so negative bases with integer
+        # exponents work (exp(b * log(a)) is NaN for a < 0).
+        return a ** b
         ### END YOUR SOLUTION
         
     def gradient(self, out_grad, node):
         ### BEGIN YOUR SOLUTION
         # raise NotImplementedError()
         lhs, rhs = node.inputs
-        grad_lhs = out_grad * rhs * node / lhs
+        # d/da a^b = b * a^(b-1); avoids dividing by `lhs` (inf/NaN at a == 0)
+        grad_lhs = out_grad * rhs * power(lhs, rhs - 1)
         grad_rhs = out_grad * node * log(lhs)
 
         return grad_lhs, grad_rhs
@@ -208,7 +211,7 @@ class Reshape(TensorOp):
     def gradient(self, out_grad, node):
         ### BEGIN YOUR SOLUTION
         # raise NotImplementedError()
-        a_shape = node.inputs[0].cached_data.shape 
+        a_shape = node.inputs[0].shape 
         return reshape(out_grad, a_shape)
         ### END YOUR SOLUTION
 
@@ -230,7 +233,7 @@ class BroadcastTo(TensorOp):
     def gradient(self, out_grad, node):
         ### BEGIN YOUR SOLUTION
         # raise NotImplementedError()
-        input_shape = node.inputs[0].cached_data.shape
+        input_shape = node.inputs[0].shape
         output_shape = self.shape 
         # align input with output 
         
@@ -277,7 +280,7 @@ class Summation(TensorOp):
     def gradient(self, out_grad, node):
         ### BEGIN YOUR SOLUTION
         # raise NotImplementedError()
-        input_shape = node.inputs[0].cached_data.shape 
+        input_shape = node.inputs[0].shape 
         ndim = len(input_shape)
         # pad the shape
         if self.axes is None:
@@ -605,6 +608,43 @@ def undilate(a, axes, dilation):
 
 
 
+class Pad(TensorOp):
+    """Zero-pad a tensor. `axes` gives (before, after) amounts for every axis."""
+
+    def __init__(self, axes: tuple):
+        self.axes = tuple(tuple(a) for a in axes)
+
+    def compute(self, a):
+        return a.pad(self.axes)
+
+    def gradient(self, out_grad, node):
+        return crop(out_grad, self.axes)
+
+
+def pad(a, axes):
+    return Pad(axes)(a)
+
+
+class Crop(TensorOp):
+    """Remove (before, after) entries from every axis; the inverse of Pad."""
+
+    def __init__(self, axes: tuple):
+        self.axes = tuple(tuple(a) for a in axes)
+
+    def compute(self, a):
+        slices = tuple(
+            slice(lo, dim - hi) for dim, (lo, hi) in zip(a.shape, self.axes)
+        )
+        return a[slices].compact()
+
+    def gradient(self, out_grad, node):
+        return pad(out_grad, self.axes)
+
+
+def crop(a, axes):
+    return Crop(axes)(a)
+
+
 def im2col(A, kernel_h, kernel_w, stride=1, padding=0):
     """
     A: NDArray with shape (N, H, W, Cin)
@@ -681,19 +721,46 @@ class Conv(TensorOp):
     def gradient(self, out_grad, node):
         ### BEGIN YOUR SOLUTION
         # raise NotImplementedError()
+        # A (N, H, W, Cin), B (Kh, Kw, Cin, Cout), out_grad (N, H_out, W_out, Cout)
         A, B = node.inputs
         N, H, W, Cin = A.shape
-        Kh, Kw, Cin_B, Cout = B.shape
-        # A (N, H, W, Cin) 
-        # B (Kh, Kw, Cin, Cout)
-        # out_grad (N, H_out, W_out, Cout)
-        if self.stride > 1:
-            G = dilate(out_grad, (1, 2), self.stride - 1) 
+        Kh, Kw, _, Cout = B.shape
+        s, p = self.stride, self.padding
+
+        # Undo the stride: put the output gradient back on the stride-1 grid.
+        G = dilate(out_grad, (1, 2), s - 1) if s > 1 else out_grad
+
+        # A stride-1 conv over the padded input would produce Hn x Wn outputs.
+        # Dilation yields H_out * s rows, which can exceed Hn when
+        # (H + 2p - Kh) is not divisible by s; the surplus rows are all zeros
+        # (they correspond to positions the strided conv never visited), so
+        # crop them off.
+        Hn = H + 2 * p - Kh + 1
+        Wn = W + 2 * p - Kw + 1
+        extra_h, extra_w = G.shape[1] - Hn, G.shape[2] - Wn
+        if extra_h > 0 or extra_w > 0:
+            G = crop(G, ((0, 0), (0, extra_h), (0, extra_w), (0, 0)))
+
+        # grad wrt A: full convolution of G with the flipped kernel.
+        B_flip = flip(transpose(B), (0, 1))  # (Kh, Kw, Cout, Cin)
+        if Kh == Kw and Kh - 1 - p >= 0:
+            A_grad = conv(G, B_flip, padding=Kh - 1 - p)
         else:
-            G = out_grad
-        A_grad = conv(G, flip(transpose(B), (0, 1)), padding=(Kh + Kw)//2 - self.padding - 1)
-        B_grad = conv(transpose(A, (0, 3)), transpose(transpose(G, (0, 2)), (0, 1)), padding=self.padding)  
-        B_grad = transpose(transpose(B_grad, (0, 1)), (1, 2))
+            # Non-square kernel (or padding >= kernel size): pad each spatial
+            # axis by its own kernel size, then crop the input padding away.
+            G_full = pad(G, ((0, 0), (Kh - 1, Kh - 1), (Kw - 1, Kw - 1), (0, 0)))
+            A_grad = conv(G_full, B_flip, padding=0)  # (N, H + 2p, W + 2p, Cin)
+            if p > 0:
+                A_grad = crop(A_grad, ((0, 0), (p, p), (p, p), (0, 0)))
+
+        # grad wrt B: correlate the (padded) input with G.
+        # (Cin, H, W, N) conv (Hn, Wn, N, Cout) -> (Cin, Kh, Kw, Cout)
+        B_grad = conv(
+            transpose(A, (0, 3)),
+            transpose(transpose(G, (0, 2)), (0, 1)),
+            padding=p,
+        )
+        B_grad = transpose(transpose(B_grad, (0, 1)), (1, 2))  # (Kh, Kw, Cin, Cout)
 
         return A_grad, B_grad
         ### END YOUR SOLUTION

@@ -321,9 +321,21 @@ class NDArray:
 
         ### BEGIN YOUR SOLUTION
         # raise NotImplementedError()
-        assert all(new_shape[i] == self._shape[i] or self._shape[i] == 1 for i in range(self.ndim)) 
+        new_shape = tuple(new_shape)
+        assert len(new_shape) >= self.ndim, "cannot broadcast to fewer dimensions"
+        # align trailing dimensions (numpy semantics): prepend size-1 axes
+        num_new = len(new_shape) - self.ndim
+        old_shape = (1,) * num_new + tuple(self._shape)
+        old_strides = (0,) * num_new + tuple(self._strides)
+        assert all(
+            new_shape[i] == old_shape[i] or old_shape[i] == 1
+            for i in range(len(new_shape))
+        ), f"cannot broadcast shape {self._shape} to {new_shape}"
 
-        new_stride = tuple([self._strides[i] if self._shape[i] != 1 else 0 for i in range(self.ndim)])
+        new_stride = tuple(
+            old_strides[i] if old_shape[i] == new_shape[i] else 0
+            for i in range(len(new_shape))
+        )
         return NDArray.make(new_shape, new_stride, device=self.device, handle=self._handle, offset=self._offset)
         ### END YOUR SOLUTION]
 
@@ -335,7 +347,7 @@ class NDArray:
         if start is None:
             start = 0
         if start < 0:
-            start = self.shape[dim]
+            start = self.shape[dim] + start
         if stop is None:
             stop = self.shape[dim]
         if stop < 0:
@@ -469,9 +481,22 @@ class NDArray:
     def __neg__(self) -> "NDArray":
         return self * (-1)
 
-    def __pow__(self, other: float) -> "NDArray":
+    def __pow__(self, other: Union["NDArray", float]) -> "NDArray":
         out = NDArray.make(self.shape, device=self.device)
-        self.device.scalar_power(self.compact()._handle, other, out._handle)
+        if isinstance(other, NDArray):
+            # Only the tensor-exponent path needs the ewise_power kernel, so
+            # scalar powers keep working on backends built without it.
+            assert self.shape == other.shape, "operation needs two equal-sized arrays"
+            if not hasattr(self.device.mod, "ewise_power"):
+                raise RuntimeError(
+                    f"{self.device} backend has no ewise_power; rebuild the "
+                    "native backends with `make clean && make`"
+                )
+            self.device.ewise_power(
+                self.compact()._handle, other.compact()._handle, out._handle
+            )
+        else:
+            self.device.scalar_power(self.compact()._handle, other, out._handle)
         return out
 
     def maximum(self, other: Union["NDArray", float]) -> "NDArray":

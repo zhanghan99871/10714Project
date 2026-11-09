@@ -233,6 +233,12 @@ void ScalarPower(const AlignedArray& a, scalar_t val, AlignedArray* out) {
   }
 }
 
+void EwisePower(const AlignedArray& a, const AlignedArray& b, AlignedArray* out) {
+  for (size_t i = 0; i < a.size; i++) {
+    out->ptr[i] = (scalar_t) std::pow(a.ptr[i], b.ptr[i]);
+  }
+}
+
 void EwiseMaximum(const AlignedArray& a, const AlignedArray& b, AlignedArray* out) {
   for (size_t i = 0; i < a.size; i++) {
     out->ptr[i] = std::max(a.ptr[i], b.ptr[i]);
@@ -476,6 +482,7 @@ PYBIND11_MODULE(ndarray_backend_cpu, m) {
   m.def("ewise_div", EwiseDiv);
   m.def("scalar_div", ScalarDiv);
   m.def("scalar_power", ScalarPower);
+  m.def("ewise_power", EwisePower);
 
   m.def("ewise_maximum", EwiseMaximum);
   m.def("scalar_maximum", ScalarMaximum);

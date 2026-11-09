@@ -63,12 +63,20 @@ class CIFAR10Dataset(Dataset):
         # raise NotImplementedError()
         image, label = self.X[index], self.y[index]
         if self.transforms:
-            image = image.transpose(1, 2, 0)
-            image = self.apply_transforms(image)
-            image = image.transpose(2, 0, 1)
+            if image.ndim == 4:
+                # batched index (e.g. from DataLoader): transform each image
+                image = np.stack([self._transform_one(img) for img in image])
+            else:
+                image = self._transform_one(image)
 
         return image, label
         ### END YOUR SOLUTION
+
+    def _transform_one(self, image):
+        # transforms operate on H x W x C images
+        image = image.transpose(1, 2, 0)
+        image = self.apply_transforms(image)
+        return image.transpose(2, 0, 1)
 
     def __len__(self) -> int:
         """

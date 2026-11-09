@@ -44,7 +44,7 @@ class LogSoftmax(TensorOp):
     def gradient(self, out_grad: Tensor, node: Tensor):
         ### BEGIN YOUR SOLUTION
         # raise NotImplementedError()
-        input_shape = node.inputs[0].cached_data.shape
+        input_shape = node.inputs[0].shape
         softmax = exp(node) 
         
         grad_sum = summation(out_grad, axes=(1, ))
@@ -113,7 +113,7 @@ class LogSumExp(TensorOp):
     def gradient(self, out_grad: Tensor, node: Tensor):
         ### BEGIN YOUR SOLUTION
         # raise NotImplementedError()
-        input_shape = node.inputs[0].cached_data.shape 
+        input_shape = node.inputs[0].shape 
         ndim = len(input_shape)
         # pad the shape
         if self.axes is None:

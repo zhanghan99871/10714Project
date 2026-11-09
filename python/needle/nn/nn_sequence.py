@@ -104,7 +104,10 @@ class RNNCell(Module):
         # raise NotImplementedError()
         bs, input_size = X.shape 
         if h is None: 
-            h = Tensor(np.zeros((bs, self.hidden_size)), device=self.device, dtype=self.dtype)
+            # Allocate on the input's device: with device=None the parameters
+            # live on init's default device, and Tensor(np...) would otherwise
+            # land on a different backend.
+            h = init.zeros(bs, self.hidden_size, device=X.device, dtype=self.dtype)
         if self.bias_hh is not None: 
             bias = self.bias_hh + self.bias_ih
             bias = ops.reshape(
@@ -289,8 +292,8 @@ class LSTMCell(Module):
         sig = Sigmoid() 
         bs, input_size = X.shape 
         if h is None: 
-            h0 = Tensor(np.zeros((bs, self.hidden_size)), device=self.device, dtype=self.dtype)
-            c0 = Tensor(np.zeros((bs, self.hidden_size)), device=self.device, dtype=self.dtype)
+            h0 = init.zeros(bs, self.hidden_size, device=X.device, dtype=self.dtype)
+            c0 = init.zeros(bs, self.hidden_size, device=X.device, dtype=self.dtype)
         else:
             h0, c0 = h 
         if self.bias_hh is not None: 
