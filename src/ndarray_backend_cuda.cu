@@ -385,57 +385,10 @@ void EwiseTanh(const CudaArray& a, CudaArray* out) { EwiseUnary(a, out, OpTanh()
 ////////////////////////////////////////////////////////////////////////////////
 
 template <typename T>
-__global__ void MatmulKernel(const T* a, const T* b, T* out, uint32_t M, uint32_t N,
-                             uint32_t P) {
-  // Shared-memory tiles and the accumulator are float regardless of T.
-  __shared__ float astile[TILE][TILE];
-  __shared__ float bstile[TILE][TILE];
-  size_t row = blockIdx.x * blockDim.x + threadIdx.x;
-  size_t col = blockIdx.y * blockDim.y + threadIdx.y;
-  float tmp = 0;
-  for (size_t ks = 0; ks < N; ks += TILE) {
-    size_t a_col = ks + threadIdx.y;
-    size_t b_row = ks + threadIdx.x;
-    astile[threadIdx.x][threadIdx.y] = (a_col < N && row < M) ? Load(a, row * N + a_col) : 0.0f;
-    bstile[threadIdx.x][threadIdx.y] = (b_row < N && col < P) ? Load(b, b_row * P + col) : 0.0f;
-    __syncthreads();
-    for (size_t k = 0; k < TILE; k++) {
-      tmp += astile[threadIdx.x][k] * bstile[k][threadIdx.y];
-    }
-    __syncthreads();
-  }
-  if (row < M && col < P) {
-    Store(out, row * P + col, tmp);
-  }
-}
-
-void Matmul(const CudaArray& a, const CudaArray& b, CudaArray* out, uint32_t M, uint32_t N,
-            uint32_t P) {
-  /**
-   * Multiply two (compact) matrices into an output (also comapct) matrix.
-   *
-   * Args:
-   *   a: compact 2D array of size m x n
-   *   b: comapct 2D array of size n x p
-   *   out: compact 2D array of size m x p to write the output to
-   *   M: rows of a / out
-   *   N: columns of a / rows of b
-   *   P: columns of b / out
-   */
-  CheckSameDType(a, b);
-  CheckSameDType(a, *out);
-  dim3 new_block(TILE, TILE);
-  dim3 new_grid((M + TILE - 1) / TILE, (P + TILE - 1) / TILE);
-  NEEDLE_DISPATCH(a.dtype, T, {
-    MatmulKernel<T><<<new_grid, new_block>>>(a.as<T>(), b.as<T>(), out->as<T>(), M, N, P);
-  });
-}
-
-template <typename T>
 __global__ void MatmulBatchedKernel(const T* a, const T* b, T* out, uint32_t batch, uint32_t M,
                                     uint32_t N, uint32_t P, size_t a_batch_stride,
                                     size_t b_batch_stride) {
-  // Same shared-memory tiling as MatmulKernel; blockIdx.z walks the batch (grid-stride, so
+  // Shared-memory tiling over the output; blockIdx.z walks the batch (grid-stride, so
   // batches larger than the grid's z limit work too). Tiles and accumulator are float.
   __shared__ float astile[TILE][TILE];
   __shared__ float bstile[TILE][TILE];
@@ -482,6 +435,27 @@ void MatmulBatched(const CudaArray& a, const CudaArray& b, CudaArray* out, uint3
                                             a_batch_stride, b_batch_stride);
   });
 }
+
+void Matmul(const CudaArray& a, const CudaArray& b, CudaArray* out, uint32_t M, uint32_t N,
+            uint32_t P) {
+  /**
+   * Multiply two (compact) matrices into an output (also comapct) matrix.
+   *
+   * Launches the batched kernel with a batch of one, so 2D and batched products run the very
+   * same compiled code and agree bit for bit (fused multiply-add contraction is a compiler
+   * decision that could otherwise differ between two separately written kernels).
+   *
+   * Args:
+   *   a: compact 2D array of size m x n
+   *   b: comapct 2D array of size n x p
+   *   out: compact 2D array of size m x p to write the output to
+   *   M: rows of a / out
+   *   N: columns of a / rows of b
+   *   P: columns of b / out
+   */
+  MatmulBatched(a, b, out, 1, M, N, P, 0, 0);
+}
+
 
 ////////////////////////////////////////////////////////////////////////////////
 // Max and sum reductions

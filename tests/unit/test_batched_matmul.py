@@ -81,13 +81,25 @@ def test_non_compact_inputs(device):
 @pytest.mark.parametrize("m,n,p", [(7, 9, 3), (16, 24, 8)], ids=["naive", "tiled"])
 @pytest.mark.parametrize("device", _NATIVE, ids=_NATIVE_IDS)
 def test_batched_equals_per_slice_2d_matmul(m, n, p, device):
-    """Every batch entry is bit-identical to the 2D matmul of that slice."""
+    """Every batch entry equals the 2D matmul of that slice.
+
+    Bit for bit wherever 2D and batched run the same compiled code: the CPU naive
+    path (both call MatmulLoop) and CUDA (2D launches the batched kernel). Whether
+    `acc += a * b` becomes a fused multiply-add is up to the compiler, so two
+    separately written loops can differ in the last bit on some machines. The
+    CPU's 2D *tiled* path (all sizes multiples of 8) is a different algorithm, so
+    there the results only agree to rounding.
+    """
     np.random.seed(2)
     a, b = np.random.randn(5, m, n).astype(f32), np.random.randn(5, n, p).astype(f32)
     batched = (nd.array(a, device=device) @ nd.array(b, device=device)).numpy()
+    cpu_tiled = device == ndl.cpu() and all(d % 8 == 0 for d in (m, n, p))
     for z in range(5):
         single = (nd.array(a[z], device=device) @ nd.array(b[z], device=device)).numpy()
-        np.testing.assert_array_equal(batched[z], single)
+        if cpu_tiled:
+            np.testing.assert_allclose(batched[z], single, rtol=1e-6, atol=1e-6)
+        else:
+            np.testing.assert_array_equal(batched[z], single)
 
 
 @pytest.mark.parametrize("device", _DEVICES, ids=_IDS)
@@ -137,7 +149,9 @@ def test_degenerate_sizes(device):
 
 
 def test_fallback_without_kernel(monkeypatch):
-    """Backends built before matmul_batched existed loop over 2D matmuls."""
+    """Backends built before matmul_batched existed loop over 2D matmuls. None of
+    these shapes is a multiple of the CPU tile size, so each 2D product runs the
+    same MatmulLoop as the batched kernel and the results are bit-identical."""
     np.random.seed(4)
     for sa, sb in SHAPES[:6]:
         a, b = np.random.randn(*sa).astype(f32), np.random.randn(*sb).astype(f32)
