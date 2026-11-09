@@ -367,7 +367,7 @@ class Tensor(Value):
             out_grad = init.ones(*self.shape, dtype=self.dtype, device=self.device)
         elif out_grad.dtype != self.dtype:
             # the adjoint of a tensor always has the tensor's dtype
-            out_grad = needle.ops.cast(out_grad, self.dtype)
+            out_grad = needle.ops.cast(out_grad, self.dtype, release_input=False)
         compute_gradient_of_variables(self, out_grad)
 
     def __repr__(self):
@@ -440,15 +440,19 @@ class Tensor(Value):
     __rmul__ = __mul__
 
     ### dtype conversion (differentiable, see ops.Cast)
-    def astype(self, dtype):
-        """Differentiable cast; returns self when the dtype already matches."""
-        return needle.ops.cast(self, dtype)
+    def astype(self, dtype, release_input: bool = True):
+        """Differentiable cast; returns self when the dtype already matches.
 
-    def half(self):
-        return self.astype("float16")
+        By default the full-precision data of a non-leaf tensor is released after
+        the cast (it is recomputed on demand if needed again); see ops.Cast.
+        """
+        return needle.ops.cast(self, dtype, release_input=release_input)
 
-    def float(self):
-        return self.astype("float32")
+    def half(self, release_input: bool = True):
+        return self.astype("float16", release_input=release_input)
+
+    def float(self, release_input: bool = True):
+        return self.astype("float32", release_input=release_input)
 
 def compute_gradient_of_variables(output_tensor, out_grad):
     """Take gradient of output node with respect to each node in node_list.
@@ -486,7 +490,7 @@ def compute_gradient_of_variables(output_tensor, out_grad):
                 and isinstance(prior_grad, Tensor)
                 and prior_grad.dtype != prior.dtype
             ):
-                prior_grad = needle.ops.cast(prior_grad, prior.dtype)
+                prior_grad = needle.ops.cast(prior_grad, prior.dtype, release_input=False)
             if prior in node_to_output_grads_list:
                 node_to_output_grads_list[prior].append(prior_grad)
             else:

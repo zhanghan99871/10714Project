@@ -21,23 +21,64 @@ class Cast(TensorOp):
     float16 -> float32 is exact. The gradient is treated as the identity and cast
     back to the *input's* dtype, so a float32 leaf used in a float16 computation
     (the "master weight" pattern of mixed precision) still gets a float32 .grad.
+
+    Releasing the input (release_input=True, the default)
+    ------------------------------------------------------
+    The output node keeps a reference to its input for backward, which would keep
+    the input's full-precision buffer alive next to the new copy. Cast's own
+    gradient only needs the input's dtype (metadata that survives release), so
+    after the cast the input's cached data is released when it is a graph
+    intermediate (non-leaf). The memory is returned once nothing else references
+    the buffer (an NDArray view of another tensor shares its memory).
+
+    The input still works afterwards: if anything later needs its value (another
+    op in forward, or a gradient such as tanh's that reads its output), it is
+    recomputed from its own inputs on demand, which costs time. Pass
+    release_input=False to keep it, e.g. when the input feeds several ops.
+
+    Never released: leaf tensors (parameters, master weights, tensors you created,
+    every tensor in inference / requires_grad=False code, since those cannot be
+    recomputed) and anything in LAZY_MODE, where the cast has not run yet.
     """
 
-    def __init__(self, dtype):
+    def __init__(self, dtype, release_input: bool = True):
         self.dtype = canonical_dtype(dtype)
+        self.release_input = release_input
+
+    def __call__(self, a):
+        out = super().__call__(a)
+        if self.release_input:
+            _release_cast_input(a, out)
+        return out
 
     def compute(self, a: NDArray):
         return a.astype(self.dtype)
 
     def gradient(self, out_grad: Tensor, node: Tensor):
-        return cast(out_grad, node.inputs[0].dtype)
+        # gradient tensors are never released: they are what .grad ends up holding
+        return cast(out_grad, node.inputs[0].dtype, release_input=False)
 
 
-def cast(a, dtype):
-    """Cast `a` to `dtype`; returns `a` itself when it already has that dtype."""
+def _release_cast_input(a, out) -> None:
+    """Free the cast input's buffer once the (eagerly computed) output exists."""
+    if (
+        isinstance(a, Tensor)
+        and not a.is_leaf()
+        and a.cached_data is not None
+        and out.cached_data is not None  # not LAZY_MODE: the cast has been computed
+    ):
+        a.release_cached_data()
+
+
+def cast(a, dtype, release_input: bool = True):
+    """Cast `a` to `dtype`; returns `a` itself when it already has that dtype.
+
+    By default a non-leaf input's cached data is released after the cast (see
+    Cast); pass release_input=False to keep it.
+    """
     if a.dtype == canonical_dtype(dtype):
         return a
-    return Cast(dtype)(a)
+    return Cast(dtype, release_input=release_input)(a)
 
 
 class EWiseAdd(TensorOp):
