@@ -12,6 +12,7 @@ import needle as ndl
 import needle.nn as nn
 from apps.models import *
 import time
+import contextlib
 device = ndl.cpu()
 
 def parse_mnist(image_filename, label_filename):
@@ -138,7 +139,35 @@ def nn_epoch(X, y, W1, W2, lr=0.1, batch=100):
     ### END YOUR SOLUTION
 
 ### CIFAR-10 training ###
-def epoch_general_cifar10(dataloader, model, loss_fn=nn.SoftmaxLoss(), opt=None):
+### Mixed precision helpers ###
+def _amp_context(amp):
+    """autocast region when amp is on; otherwise no context at all, so the
+    float32 path is exactly the original code."""
+    return ndl.autocast() if amp else contextlib.nullcontext()
+
+
+def _make_scaler(amp, opt, scaler):
+    """The GradScaler for an epoch: the caller's, or a new one when training
+    with amp, or a disabled (pass-through) one."""
+    if scaler is not None:
+        return scaler
+    return ndl.amp.GradScaler(enabled=bool(amp) and opt is not None)
+
+
+def _optimizer_step(loss, opt, scaler, clip=None):
+    """reset_grad / backward / (clip) / step, with loss scaling when enabled.
+    With a disabled scaler this is exactly reset_grad, backward, clip, step."""
+    opt.reset_grad()
+    scaler.scale(loss).backward()
+    if clip is not None:
+        scaler.unscale_(opt)  # clip the true gradients, not the scaled ones
+        opt.clip_grad_norm(clip)
+    scaler.step(opt)  # skipped if a float16 gradient overflowed
+    scaler.update()
+
+
+def epoch_general_cifar10(dataloader, model, loss_fn=nn.SoftmaxLoss(), opt=None,
+                          amp=False, scaler=None):
     """
     Iterates over the dataloader. If optimizer is not None, sets the
     model to train mode, and for each batch updates the model parameters.
@@ -150,6 +179,9 @@ def epoch_general_cifar10(dataloader, model, loss_fn=nn.SoftmaxLoss(), opt=None)
         model: nn.Module instance
         loss_fn: nn.Module instance
         opt: Optimizer instance (optional)
+        amp: run forward and loss under ndl.autocast() (float16 mixed precision)
+             and, when training, scale the loss with a GradScaler
+        scaler: GradScaler to use (e.g. shared across epochs); created when None
 
     Returns:
         avg_acc: average accuracy over dataset
@@ -166,16 +198,16 @@ def epoch_general_cifar10(dataloader, model, loss_fn=nn.SoftmaxLoss(), opt=None)
     total_loss = 0.0
     total_samples = 0
     device = model.parameters()[0].device
+    scaler = _make_scaler(amp, opt, scaler)
     for X, y in dataloader:
         X = ndl.Tensor(X, device=device, requires_grad=False)
         y = ndl.Tensor(y, device=device, requires_grad=False)
         batch_size = X.shape[0] 
-        output = model(X) 
-        loss = loss_fn(output, y) 
+        with _amp_context(amp):
+            output = model(X) 
+            loss = loss_fn(output, y) 
         if opt is not None: 
-            opt.reset_grad()
-            loss.backward() 
-            opt.step() 
+            _optimizer_step(loss, opt, scaler)
         logits = output.numpy()
         labels = y.numpy()
 
@@ -194,7 +226,7 @@ def epoch_general_cifar10(dataloader, model, loss_fn=nn.SoftmaxLoss(), opt=None)
 
 
 def train_cifar10(model, dataloader, n_epochs=1, optimizer=ndl.optim.Adam,
-          lr=0.001, weight_decay=0.001, loss_fn=nn.SoftmaxLoss):
+          lr=0.001, weight_decay=0.001, loss_fn=nn.SoftmaxLoss, amp=False, scaler=None):
     """
     Performs {n_epochs} epochs of training.
 
@@ -206,6 +238,10 @@ def train_cifar10(model, dataloader, n_epochs=1, optimizer=ndl.optim.Adam,
         lr: learning rate (float)
         weight_decay: weight decay (float)
         loss_fn: nn.Module class
+        amp: float16 mixed precision (autocast + one GradScaler for all epochs)
+        scaler: GradScaler to use with amp (default: GradScaler() with
+            init_scale 2**16; its first steps may be skipped while the scale
+            backs off to a value at which the float16 gradients do not overflow)
 
     Returns:
         avg_acc: average accuracy over dataset from last epoch of training
@@ -216,13 +252,16 @@ def train_cifar10(model, dataloader, n_epochs=1, optimizer=ndl.optim.Adam,
     # raise NotImplementedError()
     opt = optimizer(model.parameters(), lr=lr, weight_decay=weight_decay) 
     criterion = loss_fn()
+    if scaler is None:
+        scaler = ndl.amp.GradScaler(enabled=amp)
     for i in range(n_epochs):
-        acc, loss = epoch_general_cifar10(dataloader=dataloader, model=model, loss_fn=criterion, opt=opt) 
+        acc, loss = epoch_general_cifar10(dataloader=dataloader, model=model, loss_fn=criterion, opt=opt,
+                                          amp=amp, scaler=scaler)
     return acc, loss
     ### END YOUR SOLUTION
 
 
-def evaluate_cifar10(model, dataloader, loss_fn=nn.SoftmaxLoss):
+def evaluate_cifar10(model, dataloader, loss_fn=nn.SoftmaxLoss, amp=False):
     """
     Computes the test accuracy and loss of the model.
 
@@ -230,6 +269,7 @@ def evaluate_cifar10(model, dataloader, loss_fn=nn.SoftmaxLoss):
         dataloader: Dataloader instance
         model: nn.Module instance
         loss_fn: nn.Module class
+        amp: evaluate under ndl.autocast()
 
     Returns:
         avg_acc: average accuracy over dataset
@@ -239,14 +279,14 @@ def evaluate_cifar10(model, dataloader, loss_fn=nn.SoftmaxLoss):
     ### BEGIN YOUR SOLUTION
     # raise NotImplementedError()
     criterion = loss_fn()
-    acc, loss = epoch_general_cifar10(dataloader=dataloader, model=model, loss_fn=criterion) 
+    acc, loss = epoch_general_cifar10(dataloader=dataloader, model=model, loss_fn=criterion, amp=amp)
     return acc, loss 
     ### END YOUR SOLUTION
 
 
 ### PTB training ###
 def epoch_general_ptb(data, model, seq_len=40, loss_fn=nn.SoftmaxLoss(), opt=None,
-        clip=None, device=None, dtype="float32"):
+        clip=None, device=None, dtype="float32", amp=False, scaler=None):
     """
     Iterates over the data. If optimizer is not None, sets the
     model to train mode, and for each batch updates the model parameters.
@@ -259,7 +299,10 @@ def epoch_general_ptb(data, model, seq_len=40, loss_fn=nn.SoftmaxLoss(), opt=Non
         seq_len: i.e. bptt, sequence length
         loss_fn: nn.Module instance
         opt: Optimizer instance (optional)
-        clip: max norm of gradients (optional)
+        clip: max norm of gradients (optional); applied to the unscaled gradients
+        amp: run forward and loss under ndl.autocast() (float16 mixed precision)
+             and, when training, scale the loss with a GradScaler
+        scaler: GradScaler to use (e.g. shared across epochs); created when None
 
     Returns:
         avg_acc: average accuracy over dataset
@@ -279,16 +322,14 @@ def epoch_general_ptb(data, model, seq_len=40, loss_fn=nn.SoftmaxLoss(), opt=Non
     if device is None:
         device = model.parameters()[0].device
     h = None 
+    scaler = _make_scaler(amp, opt, scaler)
     for i in range(0, data.shape[0] - 1, seq_len):
         X, y = get_batch(data, i, seq_len, device=device, dtype=dtype)
-        output, h = model(X, h) 
-        loss = loss_fn(output, y) 
+        with _amp_context(amp):
+            output, h = model(X, h) 
+            loss = loss_fn(output, y) 
         if opt is not None: 
-            opt.reset_grad()
-            loss.backward() 
-            if clip is not None: 
-                opt.clip_grad_norm(clip)
-            opt.step() 
+            _optimizer_step(loss, opt, scaler, clip)
         # detach h 
         if isinstance(h, tuple):
             h = tuple(state.detach() for state in h)
@@ -312,7 +353,7 @@ def epoch_general_ptb(data, model, seq_len=40, loss_fn=nn.SoftmaxLoss(), opt=Non
 
 def train_ptb(model, data, seq_len=40, n_epochs=1, optimizer=ndl.optim.SGD,
           lr=4.0, weight_decay=0.0, loss_fn=nn.SoftmaxLoss, clip=None,
-          device=None, dtype="float32"):
+          device=None, dtype="float32", amp=False, scaler=None):
     """
     Performs {n_epochs} epochs of training.
 
@@ -326,6 +367,10 @@ def train_ptb(model, data, seq_len=40, n_epochs=1, optimizer=ndl.optim.SGD,
         weight_decay: weight decay (float)
         loss_fn: nn.Module class
         clip: max norm of gradients (optional)
+        amp: float16 mixed precision (autocast + one GradScaler for all epochs)
+        scaler: GradScaler to use with amp (default: GradScaler() with
+            init_scale 2**16; its first steps may be skipped while the scale
+            backs off to a value at which the float16 gradients do not overflow)
 
     Returns:
         avg_acc: average accuracy over dataset from last epoch of training
@@ -336,13 +381,16 @@ def train_ptb(model, data, seq_len=40, n_epochs=1, optimizer=ndl.optim.SGD,
     # raise NotImplementedError()
     opt = optimizer(model.parameters(), lr=lr, weight_decay=weight_decay) 
     criterion = loss_fn()
+    if scaler is None:
+        scaler = ndl.amp.GradScaler(enabled=amp)
     for i in range(n_epochs):
-        acc, loss = epoch_general_ptb(data, model, seq_len, criterion, opt, clip, device, dtype)
+        acc, loss = epoch_general_ptb(data, model, seq_len, criterion, opt, clip, device, dtype,
+                                      amp=amp, scaler=scaler)
     return acc, loss
     ### END YOUR SOLUTION
 
 def evaluate_ptb(model, data, seq_len=40, loss_fn=nn.SoftmaxLoss,
-        device=None, dtype="float32"):
+        device=None, dtype="float32", amp=False):
     """
     Computes the test accuracy and loss of the model.
 
@@ -351,6 +399,7 @@ def evaluate_ptb(model, data, seq_len=40, loss_fn=nn.SoftmaxLoss,
         data: data of shape (nbatch, batch_size) given from batchify function
         seq_len: i.e. bptt, sequence length
         loss_fn: nn.Module class
+        amp: evaluate under ndl.autocast()
 
     Returns:
         avg_acc: average accuracy over dataset
@@ -360,7 +409,7 @@ def evaluate_ptb(model, data, seq_len=40, loss_fn=nn.SoftmaxLoss,
     ### BEGIN YOUR SOLUTION
     # raise NotImplementedError()
     criterion = loss_fn()
-    acc, loss = epoch_general_ptb(data, model, seq_len, criterion, device=device, dtype=dtype)
+    acc, loss = epoch_general_ptb(data, model, seq_len, criterion, device=device, dtype=dtype, amp=amp)
     return acc, loss 
     ### END YOUR SOLUTION
 

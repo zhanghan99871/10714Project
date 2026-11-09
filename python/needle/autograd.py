@@ -19,8 +19,125 @@ NDArray = numpy.ndarray
 
 from .backend_selection import array_api, NDArray, default_device, cpu
 
+
+def canonical_dtype(dtype) -> Optional[str]:
+    """Canonical dtype name ("float32", "float16", ...); None stays None.
+
+    Accepts strings, numpy dtypes and numpy scalar types, so "float16",
+    numpy.float16 and numpy.dtype("float16") all compare equal afterwards.
+    """
+    if dtype is None:
+        return None
+    return numpy.dtype(dtype).name
+
+
+def _check_input_dtypes(op: "Op", inputs: List["Value"]) -> None:
+    """Ops compute on a single dtype; mixing float16 and float32 inputs must be
+    an explicit cast rather than a backend assertion deep inside compute()."""
+    dtypes = {x.dtype for x in inputs if isinstance(x, Tensor)}
+    if len(dtypes) > 1:
+        raise TypeError(
+            f"{type(op).__name__} got inputs with different dtypes {sorted(dtypes)}; "
+            "cast explicitly with tensor.astype(dtype) or ops.cast(tensor, dtype)"
+        )
+
+
+##############################
+####### Autocast state #######
+##############################
+
+# Per-op autocast policies (the class attribute Op.autocast_policy):
+AUTOCAST_LOWER = "lower"      # run in the autocast dtype (float16): MatMul, Conv
+AUTOCAST_FP32 = "float32"     # run in float32: reductions, exp/log, powers, softmax
+AUTOCAST_PROMOTE = "promote"  # default: mixed inputs are cast to the widest dtype
+AUTOCAST_SKIP = "skip"        # never touched (Cast itself)
+
+
+class _AutocastState:
+    """Global autocast configuration; managed by needle.amp.autocast."""
+
+    def __init__(self):
+        self.enabled = False
+        self.dtype = "float16"
+        self.cache_enabled = True
+        self.release_inputs = False
+        # (id(leaf), dtype) -> (leaf, leaf.cached_data at cast time, cast tensor)
+        self.cache = {}
+
+
+_AUTOCAST = _AutocastState()
+
+
+def _widest_dtype(dtypes) -> str:
+    return max(dtypes, key=lambda d: (numpy.dtype(d).itemsize, d))
+
+
+def _autocast_cast(x: "Tensor", dtype: str) -> "Tensor":
+    """Cast for an autocast region. Parameters (leaves that require grad) are cast
+    once per region and reused, so e.g. an RNN weight used at every time step is
+    not converted again for each step. The cache entry is invalidated when the
+    leaf's data is replaced (e.g. by an optimizer step inside the region)."""
+    if _AUTOCAST.cache_enabled and x.is_leaf() and x.requires_grad:
+        key = (id(x), dtype)
+        hit = _AUTOCAST.cache.get(key)
+        if hit is not None and hit[0] is x and hit[1] is x.cached_data:
+            return hit[2]
+        out = needle.ops.cast(x, dtype, release_input=False)
+        _AUTOCAST.cache[key] = (x, x.cached_data, out)
+        return out
+    return needle.ops.cast(x, dtype, release_input=_AUTOCAST.release_inputs)
+
+
+def _autocast_inputs(op: "Op", inputs: List["Value"]) -> List["Value"]:
+    """Cast an op's tensor inputs according to op.autocast_policy."""
+    policy = getattr(op, "autocast_policy", AUTOCAST_PROMOTE)
+    if policy == AUTOCAST_SKIP:
+        return inputs
+    dtypes = {x.dtype for x in inputs if isinstance(x, Tensor)}
+    if not dtypes:
+        return inputs
+    if policy == AUTOCAST_LOWER:
+        target = _AUTOCAST.dtype
+    elif policy == AUTOCAST_FP32:
+        target = "float32"
+    else:  # promote
+        if len(dtypes) == 1:
+            return inputs
+        target = _widest_dtype(dtypes)
+    return [
+        _autocast_cast(x, target) if isinstance(x, Tensor) and x.dtype != target else x
+        for x in inputs
+    ]
+
+
+def autocast_promote(tensors: List["Tensor"]) -> List["Tensor"]:
+    """Under autocast, cast a list of tensors to their widest dtype (used by ops
+    that take a tuple, e.g. stack); outside autocast the list is returned as is."""
+    if not _AUTOCAST.enabled or LAZY_MODE:
+        return list(tensors)
+    dtypes = {t.dtype for t in tensors}
+    if len(dtypes) <= 1:
+        return list(tensors)
+    target = _widest_dtype(dtypes)
+    return [_autocast_cast(t, target) if t.dtype != target else t for t in tensors]
+
+
+class _AutocastDisabled:
+    """Internal: suspend autocast (backward always runs in the forward dtypes)."""
+
+    def __enter__(self):
+        self.prev = _AUTOCAST.enabled
+        _AUTOCAST.enabled = False
+
+    def __exit__(self, *exc):
+        _AUTOCAST.enabled = self.prev
+        return False
+
 class Op:
     """Operator definition."""
+
+    # how autocast treats this op's inputs (see AUTOCAST_* above)
+    autocast_policy = AUTOCAST_PROMOTE
 
     def __call__(self, *args):
         raise NotImplementedError()
@@ -243,6 +360,7 @@ class Tensor(Value):
         requires_grad=True,
         **kwargs
     ):
+        dtype = canonical_dtype(dtype)
         if isinstance(array, Tensor):
             if device is None:
                 device = array.device
@@ -250,6 +368,9 @@ class Tensor(Value):
                 dtype = array.dtype
             if device == array.device and dtype == array.dtype:
                 cached_data = array.realize_cached_data()
+            elif device == array.device:
+                # same device, new dtype: convert on the device
+                cached_data = array.realize_cached_data().astype(dtype)
             else:
                 # fall back, copy through numpy conversion
                 cached_data = Tensor._array_from_numpy(
@@ -274,6 +395,10 @@ class Tensor(Value):
 
     @staticmethod
     def make_from_op(op: Op, inputs: List["Value"]):
+        if not LAZY_MODE:
+            if _AUTOCAST.enabled:
+                inputs = _autocast_inputs(op, list(inputs))
+            _check_input_dtypes(op, inputs)
         tensor = Tensor.__new__(Tensor)
         tensor._init(op, inputs)
         if not LAZY_MODE:
@@ -335,11 +460,11 @@ class Tensor(Value):
         return self._device
 
     def backward(self, out_grad=None):
-        out_grad = (
-            out_grad
-            if out_grad
-            else init.ones(*self.shape, dtype=self.dtype, device=self.device)
-        )
+        if out_grad is None:
+            out_grad = init.ones(*self.shape, dtype=self.dtype, device=self.device)
+        elif out_grad.dtype != self.dtype:
+            # the adjoint of a tensor always has the tensor's dtype
+            out_grad = needle.ops.cast(out_grad, self.dtype, release_input=False)
         compute_gradient_of_variables(self, out_grad)
 
     def __repr__(self):
@@ -411,11 +536,51 @@ class Tensor(Value):
     __radd__ = __add__
     __rmul__ = __mul__
 
+    ### dtype conversion (differentiable, see ops.Cast)
+    def astype(self, dtype, release_input: bool = True):
+        """Differentiable cast; returns self when the dtype already matches.
+
+        By default the full-precision data of a non-leaf tensor is released after
+        the cast (it is recomputed on demand if needed again); see ops.Cast.
+        """
+        return needle.ops.cast(self, dtype, release_input=release_input)
+
+    def half(self, release_input: bool = True):
+        return self.astype("float16", release_input=release_input)
+
+    def float(self, release_input: bool = True):
+        return self.astype("float32", release_input=release_input)
+
 def compute_gradient_of_variables(output_tensor, out_grad):
     """Take gradient of output node with respect to each node in node_list.
 
     Store the computed result in the grad field of each Variable.
+
+    Autocast is suspended while the gradient graph is built: every gradient op
+    runs in the dtypes the forward pass chose, whether or not backward() is
+    called inside an autocast region.
     """
+    with _AutocastDisabled():
+        _compute_gradient_of_variables(output_tensor, out_grad)
+
+
+def _sum_adjoints(grads: List["Value"]) -> "Value":
+    """Sum the partial adjoints of one node. float16 adjoints are accumulated in
+    float32 and rounded once (a float16 running sum loses precision quickly, e.g.
+    a weight cast once per autocast region and used at every RNN time step)."""
+    if (
+        len(grads) > 1
+        and isinstance(grads[0], Tensor)
+        and grads[0].dtype == "float16"
+    ):
+        total = sum_node_list(
+            [needle.ops.cast(g, "float32", release_input=False) for g in grads]
+        )
+        return needle.ops.cast(total, "float16", release_input=False)
+    return sum_node_list(grads)
+
+
+def _compute_gradient_of_variables(output_tensor, out_grad):
     # a map from node to a list of gradient contributions from each output node
     node_to_output_grads_list: Dict[Tensor, List[Tensor]] = {}
     # Special note on initializing gradient of
@@ -431,13 +596,23 @@ def compute_gradient_of_variables(output_tensor, out_grad):
     for each in reverse_topo_order:
         if not each.requires_grad:
             continue
-        each.grad = sum_node_list(node_to_output_grads_list[each]) 
+        each.grad = _sum_adjoints(node_to_output_grads_list[each])
         if each.op is None:
             continue
         prior_grads = each.op.gradient_as_tuple(each.grad, each)
         for i in range(len(prior_grads)):
             prior = each.inputs[i] 
             prior_grad = prior_grads[i] 
+            # Invariant for mixed precision: a node's adjoint has the node's dtype
+            # (so float32 master weights always get float32 grads and partial
+            # adjoints of one node can be summed). Ops' gradients normally ensure
+            # this already; cast any stray contribution instead of failing later.
+            if (
+                isinstance(prior, Tensor)
+                and isinstance(prior_grad, Tensor)
+                and prior_grad.dtype != prior.dtype
+            ):
+                prior_grad = needle.ops.cast(prior_grad, prior.dtype, release_input=False)
             if prior in node_to_output_grads_list:
                 node_to_output_grads_list[prior].append(prior_grad)
             else:

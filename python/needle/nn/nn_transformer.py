@@ -37,16 +37,27 @@ class MultiHeadAttention(Module):
         self.causal = causal
         self.dropout = Dropout(dropout)
 
-    def create_causal_mask(self, i, j, device):
+    @staticmethod
+    def causal_mask_value(dtype="float32"):
+        """Additive value for masked positions in `dtype`: half the largest finite
+        value. It is still "minus infinity" for softmax (exp underflows to exactly
+        0), but unlike -finfo(float32).max it is finite in float16 (that becomes
+        -inf there, and a row of -inf gives NaN after the max subtraction), and the
+        factor 1/2 leaves headroom so adding it to a negative logit cannot
+        overflow to -inf either."""
+        return -np.finfo(dtype).max / 2
+
+    def create_causal_mask(self, i, j, device, dtype="float32"):
         """
         return a triangular causal mask.
         Input: i, j: the shape of the mask to be created
+               dtype: dtype of the attention logits the mask is added to
         """
-        mask = -np.finfo(np.float32).max * np.triu(
-            np.ones((1, 1, i, j), dtype=np.float32), j - i + 1)
+        mask = self.causal_mask_value(dtype) * np.triu(
+            np.ones((1, 1, i, j), dtype=dtype), j - i + 1)
 
         return ndarray.array(
-            mask, device=device)
+            mask, device=device, dtype=dtype)
 
     def matmul(self, a, b_transpose):
         """
@@ -112,10 +123,14 @@ class MultiHeadAttention(Module):
         # raise NotImplementedError()
         qkt = self.matmul(q, k) * (1 / np.sqrt(q_dim)) 
         if self.causal:
+            # build the mask in the logits' dtype (float16 under a float16 model,
+            # float32 under autocast or a float32 model) so it never mixes dtypes
             mask = Tensor(
-                self.create_causal_mask(queries_len, keys_values_len, q.device),
+                self.create_causal_mask(
+                    queries_len, keys_values_len, q.device, dtype=qkt.dtype
+                ),
                 device=q.device,
-                dtype=self.dtype,
+                dtype=qkt.dtype,
                 requires_grad=False,
             )
             mask = ops.broadcast_to(mask, qkt.shape) 

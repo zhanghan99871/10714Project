@@ -6,12 +6,82 @@ from typing import Optional, List, Tuple, Union
 from ..autograd import NDArray
 from ..autograd import Op, Tensor, Value, TensorOp
 from ..autograd import TensorTuple, TensorTupleOp
+from ..autograd import canonical_dtype
+from ..autograd import AUTOCAST_LOWER, AUTOCAST_FP32, AUTOCAST_SKIP, autocast_promote
 
 # NOTE: we will import numpy as the array_api
 # as the backend for our computations, this line will change in later homeworks
 
 from ..backend_selection import array_api, BACKEND
 from .ops_tuple import *
+
+class Cast(TensorOp):
+    """Convert a tensor to another floating point dtype, e.g. "float16" / "float32".
+
+    float32 -> float16 rounds to nearest even (and saturates to +-inf above 65504);
+    float16 -> float32 is exact. The gradient is treated as the identity and cast
+    back to the *input's* dtype, so a float32 leaf used in a float16 computation
+    (the "master weight" pattern of mixed precision) still gets a float32 .grad.
+
+    Releasing the input (release_input=True, the default)
+    ------------------------------------------------------
+    The output node keeps a reference to its input for backward, which would keep
+    the input's full-precision buffer alive next to the new copy. Cast's own
+    gradient only needs the input's dtype (metadata that survives release), so
+    after the cast the input's cached data is released when it is a graph
+    intermediate (non-leaf). The memory is returned once nothing else references
+    the buffer (an NDArray view of another tensor shares its memory).
+
+    The input still works afterwards: if anything later needs its value (another
+    op in forward, or a gradient such as tanh's that reads its output), it is
+    recomputed from its own inputs on demand, which costs time. Pass
+    release_input=False to keep it, e.g. when the input feeds several ops.
+
+    Never released: leaf tensors (parameters, master weights, tensors you created,
+    every tensor in inference / requires_grad=False code, since those cannot be
+    recomputed) and anything in LAZY_MODE, where the cast has not run yet.
+    """
+    autocast_policy = AUTOCAST_SKIP
+
+    def __init__(self, dtype, release_input: bool = True):
+        self.dtype = canonical_dtype(dtype)
+        self.release_input = release_input
+
+    def __call__(self, a):
+        out = super().__call__(a)
+        if self.release_input:
+            _release_cast_input(a, out)
+        return out
+
+    def compute(self, a: NDArray):
+        return a.astype(self.dtype)
+
+    def gradient(self, out_grad: Tensor, node: Tensor):
+        # gradient tensors are never released: they are what .grad ends up holding
+        return cast(out_grad, node.inputs[0].dtype, release_input=False)
+
+
+def _release_cast_input(a, out) -> None:
+    """Free the cast input's buffer once the (eagerly computed) output exists."""
+    if (
+        isinstance(a, Tensor)
+        and not a.is_leaf()
+        and a.cached_data is not None
+        and out.cached_data is not None  # not LAZY_MODE: the cast has been computed
+    ):
+        a.release_cached_data()
+
+
+def cast(a, dtype, release_input: bool = True):
+    """Cast `a` to `dtype`; returns `a` itself when it already has that dtype.
+
+    By default a non-leaf input's cached data is released after the cast (see
+    Cast); pass release_input=False to keep it.
+    """
+    if a.dtype == canonical_dtype(dtype):
+        return a
+    return Cast(dtype, release_input=release_input)(a)
+
 
 class EWiseAdd(TensorOp):
     def compute(self, a: NDArray, b: NDArray):
@@ -70,6 +140,7 @@ def mul_scalar(a, scalar):
 
 class EWisePow(TensorOp):
     """Op to element-wise raise a tensor to a power."""
+    autocast_policy = AUTOCAST_FP32
 
     def compute(self, a: NDArray, b: NDArray) -> NDArray:
         ### BEGIN YOUR SOLUTION
@@ -96,6 +167,7 @@ def power(a, b):
 
 class PowerScalar(TensorOp):
     """Op raise a tensor to an (integer) power."""
+    autocast_policy = AUTOCAST_FP32
 
     def __init__(self, scalar: int):
         self.scalar = scalar
@@ -251,6 +323,8 @@ def broadcast_to(a, shape):
 
 
 class Summation(TensorOp):
+    autocast_policy = AUTOCAST_FP32
+
     def __init__(self, axes: Optional[tuple] = None):
         self.axes = axes
 
@@ -304,6 +378,8 @@ def summation(a, axes=None):
 
 
 class MatMul(TensorOp):
+    autocast_policy = AUTOCAST_LOWER
+
     def compute(self, a, b):
         ### BEGIN YOUR SOLUTION
         # raise NotImplementedError()
@@ -358,6 +434,8 @@ def negate(a):
 
 
 class Log(TensorOp):
+    autocast_policy = AUTOCAST_FP32
+
     def compute(self, a):
         ### BEGIN YOUR SOLUTION
         # raise NotImplementedError()
@@ -377,6 +455,8 @@ def log(a):
 
 
 class Exp(TensorOp):
+    autocast_policy = AUTOCAST_FP32
+
     def compute(self, a):
         ### BEGIN YOUR SOLUTION
         # raise NotImplementedError()
@@ -455,12 +535,18 @@ class Stack(TensorOp):
         shape = args[0].shape
         ndim = len(shape) + 1
         axis = self.axis % ndim
+        dtypes = {str(a.dtype) for a in args}
+        if len(dtypes) > 1:
+            raise TypeError(
+                f"stack needs tensors of a single dtype, got {sorted(dtypes)}; "
+                "use .astype() to convert"
+            )
 
         # Insert a new dimension
         new_shape = shape[:axis] + (len(args),) + shape[axis:]
 
         out = array_api.empty(
-            new_shape, device=args[0].device
+            new_shape, dtype=args[0].dtype, device=args[0].device
         )
         for i, a in enumerate(args):
             slices = (
@@ -483,7 +569,8 @@ class Stack(TensorOp):
 
 
 def stack(args, axis):
-    return Stack(axis)(make_tuple(*args))
+    # under autocast, tensors of mixed dtypes are promoted to the widest one
+    return Stack(axis)(make_tuple(*autocast_promote(args)))
 
 
 class Split(TensorTupleOp):
@@ -564,7 +651,7 @@ class Dilate(TensorOp):
         ndim = len(a.shape)
         new_shape = tuple([a.shape[i] * (self.dilation + 1) if i in self.axes else a.shape[i] for i in range(ndim)])
         result = array_api.empty(
-            new_shape, device=a.device
+            new_shape, dtype=a.dtype, device=a.device
         )
         result.fill(0.0)
         new_slice = tuple([slice(None, None, self.dilation+1) if i in self.axes else slice(None) for i in range(ndim)])
@@ -696,6 +783,8 @@ def im2col(A, kernel_h, kernel_w, stride=1, padding=0):
 
 
 class Conv(TensorOp):
+    autocast_policy = AUTOCAST_LOWER
+
     def __init__(self, stride: Optional[int] = 1, padding: Optional[int] = 0):
         self.stride = stride
         self.padding = padding
