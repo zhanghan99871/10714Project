@@ -431,6 +431,58 @@ void Matmul(const CudaArray& a, const CudaArray& b, CudaArray* out, uint32_t M, 
   });
 }
 
+template <typename T>
+__global__ void MatmulBatchedKernel(const T* a, const T* b, T* out, uint32_t batch, uint32_t M,
+                                    uint32_t N, uint32_t P, size_t a_batch_stride,
+                                    size_t b_batch_stride) {
+  // Same shared-memory tiling as MatmulKernel; blockIdx.z walks the batch (grid-stride, so
+  // batches larger than the grid's z limit work too). Tiles and accumulator are float.
+  __shared__ float astile[TILE][TILE];
+  __shared__ float bstile[TILE][TILE];
+  size_t row = blockIdx.x * blockDim.x + threadIdx.x;
+  size_t col = blockIdx.y * blockDim.y + threadIdx.y;
+  for (size_t z = blockIdx.z; z < batch; z += gridDim.z) {
+    const T* az = a + z * a_batch_stride;
+    const T* bz = b + z * b_batch_stride;
+    T* oz = out + z * (size_t)M * P;
+    float tmp = 0;
+    for (size_t ks = 0; ks < N; ks += TILE) {
+      size_t a_col = ks + threadIdx.y;
+      size_t b_row = ks + threadIdx.x;
+      astile[threadIdx.x][threadIdx.y] = (a_col < N && row < M) ? Load(az, row * N + a_col) : 0.0f;
+      bstile[threadIdx.x][threadIdx.y] = (b_row < N && col < P) ? Load(bz, b_row * P + col) : 0.0f;
+      __syncthreads();
+      for (size_t k = 0; k < TILE; k++) {
+        tmp += astile[threadIdx.x][k] * bstile[k][threadIdx.y];
+      }
+      __syncthreads();
+    }
+    if (row < M && col < P) {
+      Store(oz, row * P + col, tmp);
+    }
+  }
+}
+
+void MatmulBatched(const CudaArray& a, const CudaArray& b, CudaArray* out, uint32_t batch,
+                   uint32_t M, uint32_t N, uint32_t P, size_t a_batch_stride,
+                   size_t b_batch_stride) {
+  /**
+   * Batched matrix multiplication: out[z] = a[z] @ b[z] for z < batch.
+   *
+   * a / b: compact arrays; matrix z starts at z * a_batch_stride / z * b_batch_stride elements
+   * (stride 0: one matrix shared by the whole batch). out: compact batch x M x P.
+   */
+  CheckSameDType(a, b);
+  CheckSameDType(a, *out);
+  if (batch == 0 || M == 0 || P == 0) return;
+  dim3 block(TILE, TILE);
+  dim3 grid((M + TILE - 1) / TILE, (P + TILE - 1) / TILE, std::min<uint32_t>(batch, 65535));
+  NEEDLE_DISPATCH(a.dtype, T, {
+    MatmulBatchedKernel<T><<<grid, block>>>(a.as<T>(), b.as<T>(), out->as<T>(), batch, M, N, P,
+                                            a_batch_stride, b_batch_stride);
+  });
+}
+
 ////////////////////////////////////////////////////////////////////////////////
 // Max and sum reductions
 ////////////////////////////////////////////////////////////////////////////////
@@ -606,6 +658,7 @@ PYBIND11_MODULE(ndarray_backend_cuda, m) {
   m.def("ewise_tanh", EwiseTanh);
 
   m.def("matmul", Matmul);
+  m.def("matmul_batched", MatmulBatched);
 
   m.def("reduce_max", ReduceMax);
   m.def("reduce_sum", ReduceSum);

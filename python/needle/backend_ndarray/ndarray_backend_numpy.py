@@ -199,6 +199,15 @@ def matmul(a, b, out, m, n, p):
 
 
 @_ieee
+def matmul_batched(a, b, out, batch, m, n, p, a_batch_stride, b_batch_stride):
+    """out[z] = a[z] @ b[z]; a batch stride of 0 means one matrix shared by all z."""
+    _check_same_dtype(a, b, out)
+    A = _f32(a).reshape(-1 if a_batch_stride else 1, m, n)
+    B = _f32(b).reshape(-1 if b_batch_stride else 1, n, p)
+    out.array[:] = np.broadcast_to(np.matmul(A, B), (batch, m, p)).reshape(-1)
+
+
+@_ieee
 def reduce_max(a, out, reduce_size):
     _check_same_dtype(a, out)
     out.array[:] = a.array[:].reshape(-1, reduce_size).max(axis=1)

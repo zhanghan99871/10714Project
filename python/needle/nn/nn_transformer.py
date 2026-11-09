@@ -61,23 +61,14 @@ class MultiHeadAttention(Module):
 
     def matmul(self, a, b_transpose):
         """
-        batched matrix multiplication;
+        batched matrix multiplication a @ b_transpose^T over the last two axes;
+        (..., m, d) x (..., n, d) -> (..., m, n).
+
+        Uses the batched MatMul op. (The previous version broadcast both inputs to
+        (..., m, n, d), multiplied and summed over d, materializing an m * n * d
+        tensor per batch entry.)
         """
-        a_shape = (*a.shape[:-1], 1, *a.shape[-1:])
-        a = a.reshape(a_shape)
-
-        b_transpose_shape = (*b_transpose.shape[:-2], 1, *b_transpose.shape[-2:])
-        b_transpose = b_transpose.reshape(b_transpose_shape)
-
-        broadcast_shape = list(a_shape)
-        broadcast_shape[-2] = b_transpose_shape[-2]
-        a = a.broadcast_to(broadcast_shape)
-
-        broadcast_shape = list(b_transpose_shape)
-        broadcast_shape[-3] = a_shape[-3]
-        b_transpose = b_transpose.broadcast_to(broadcast_shape)
-
-        return (a * b_transpose).sum(len(a.shape) - 1)
+        return ops.matmul(a, ops.transpose(b_transpose))
 
     def softmax(self, logit):
         """
@@ -137,8 +128,7 @@ class MultiHeadAttention(Module):
             qkt += mask 
         a = self.softmax(qkt) 
         probs = self.dropout(a) 
-        vt = ops.transpose(v, (2, 3))
-        result = self.matmul(probs, vt) 
+        result = ops.matmul(probs, v) 
 
         ### END YOUR SOLUTION
 

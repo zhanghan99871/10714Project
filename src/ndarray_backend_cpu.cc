@@ -9,6 +9,7 @@
 #include <iostream>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 namespace needle {
 namespace cpu {
@@ -378,6 +379,44 @@ void Matmul(const AlignedArray& a, const AlignedArray& b, AlignedArray* out, uin
   });
 }
 
+void MatmulBatched(const AlignedArray& a, const AlignedArray& b, AlignedArray* out,
+                   uint32_t batch, uint32_t m, uint32_t n, uint32_t p, size_t a_batch_stride,
+                   size_t b_batch_stride) {
+  /**
+   * Batched matrix multiplication: out[z] = a[z] @ b[z] for z < batch.
+   *
+   * Args:
+   *   a: compact array holding the m x n matrices of a; matrix z starts at z * a_batch_stride
+   *   b: compact array holding the n x p matrices of b; matrix z starts at z * b_batch_stride
+   *   out: compact batch x m x p array
+   *   a_batch_stride / b_batch_stride: elements between consecutive matrices (m * n or n * p),
+   *     or 0 for a single matrix shared by the whole batch (broadcasting, no copy needed)
+   *
+   * Loop order i, k, j with a float32 row accumulator: contiguous access to b and out, and the
+   * products are added in the same (ascending k) order as Matmul. float16 accumulates in float32.
+   */
+  CheckSameDType(a, b);
+  CheckSameDType(a, *out);
+  NEEDLE_DISPATCH(a.dtype, T, {
+    const T* pa = a.as<T>();
+    const T* pb = b.as<T>();
+    T* po = out->as<T>();
+    std::vector<float> acc(p);
+    for (size_t z = 0; z < batch; z++) {
+      const size_t a0 = z * a_batch_stride, b0 = z * b_batch_stride, o0 = z * (size_t)m * p;
+      for (size_t i = 0; i < m; i++) {
+        std::fill(acc.begin(), acc.end(), 0.0f);
+        for (size_t k = 0; k < n; k++) {
+          const float a_ik = Load(pa, a0 + i * n + k);
+          const size_t brow = b0 + k * p;
+          for (size_t j = 0; j < p; j++) acc[j] += a_ik * Load(pb, brow + j);
+        }
+        for (size_t j = 0; j < p; j++) Store(po, o0 + i * p + j, acc[j]);
+      }
+    }
+  });
+}
+
 inline void AlignedDot(const float* __restrict__ a,
                        const float* __restrict__ b,
                        float* __restrict__ out) {
@@ -597,6 +636,7 @@ PYBIND11_MODULE(ndarray_backend_cpu, m) {
 
   m.def("matmul", Matmul);
   m.def("matmul_tiled", MatmulTiled);
+  m.def("matmul_batched", MatmulBatched);
 
   m.def("reduce_max", ReduceMax);
   m.def("reduce_sum", ReduceSum);

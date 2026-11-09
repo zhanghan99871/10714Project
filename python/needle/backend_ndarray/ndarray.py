@@ -616,9 +616,15 @@ class NDArray:
 
     ### Matrix multiplication
     def __matmul__(self, other: "NDArray") -> "NDArray":
-        """Matrix multplication of two arrays.  This requires that both arrays
-        be 2D (i.e., we don't handle batch matrix multiplication), and that the
-        sizes match up properly for matrix multiplication.
+        """Matrix multplication of two arrays.
+
+        Arrays with more than two dimensions are batched matrix multiplications
+        with numpy semantics: (..., m, n) @ (..., n, p) -> (..., m, p), the
+        leading (batch) dimensions broadcast against each other; see
+        batched_matmul(). The text below describes the 2D case.
+
+        Both arrays must be 2D here, and the sizes must match up properly for
+        matrix multiplication.
 
         In the case of the CPU backend, you will implement an efficient "tiled"
         version of matrix multiplication for the case when all dimensions of
@@ -632,7 +638,8 @@ class NDArray:
         the GPU version will just work natively by tiling any input size).
         """
 
-        assert self.ndim == 2 and other.ndim == 2
+        if self.ndim != 2 or other.ndim != 2:
+            return self.batched_matmul(other)
         assert self.shape[1] == other.shape[0]
         assert self.dtype == other.dtype, (
             f"matmul needs two arrays of the same dtype, got {self.dtype} and {other.dtype}"
@@ -669,6 +676,64 @@ class NDArray:
                 self.compact()._handle, other.compact()._handle, out._handle, m, n, p
             )
             return out
+
+    def _batch_operand(self, batch: tuple[int, ...]) -> tuple["NDArray", int]:
+        """This array's matrices as a compact buffer for matmul_batched, plus the
+        stride (in elements) between consecutive matrices of the batch.
+
+        - every batch dimension is 1 (or there is none): one matrix shared by the
+          whole batch, stride 0 -- broadcasting without copying (e.g. a weight);
+        - batch dimensions equal to `batch`: compact as is, stride rows * cols;
+        - partially broadcast (e.g. (B, 1, m, n) against (1, H, n, p)): the
+          broadcast is materialized by compact().
+        """
+        rows, cols = self.shape[-2:]
+        own = self.shape[:-2]
+        if prod(own) == 1:
+            return self.compact().reshape((rows, cols)), 0
+        if (1,) * (len(batch) - len(own)) + tuple(own) == tuple(batch):
+            return self.compact(), rows * cols
+        return self.broadcast_to(tuple(batch) + (rows, cols)).compact(), rows * cols
+
+    def batched_matmul(self, other: "NDArray") -> "NDArray":
+        """(..., m, n) @ (..., n, p) -> (broadcast(...), m, p), numpy semantics.
+
+        Uses the backend's matmul_batched kernel (float32 accumulation for
+        float16 input); a backend without it falls back to one 2D matmul per
+        batch entry.
+        """
+        if self.ndim < 2 or other.ndim < 2:
+            raise ValueError(
+                f"matmul needs arrays with at least 2 dimensions, got {self.shape} and {other.shape}"
+            )
+        m, n = self.shape[-2:]
+        n2, p = other.shape[-2:]
+        if n != n2:
+            raise ValueError(f"matmul: shapes {self.shape} and {other.shape} are not aligned")
+        assert self.dtype == other.dtype, (
+            f"matmul needs two arrays of the same dtype, got {self.dtype} and {other.dtype}"
+        )
+        batch = broadcast_shapes(self.shape[:-2], other.shape[:-2])
+        size = prod(batch)
+        out_shape = tuple(batch) + (m, p)
+        a, a_stride = self._batch_operand(batch)
+        b, b_stride = other._batch_operand(batch)
+        out = NDArray.make((size, m, p), device=self.device, dtype=self.dtype)
+        kernel = getattr(self.device.mod, "matmul_batched", None)
+        if size == 0 or m == 0 or p == 0:
+            pass
+        elif n == 0:
+            out.fill(0.0)
+        elif kernel is not None:
+            kernel(a._handle, b._handle, out._handle, size, m, n, p, a_stride, b_stride)
+        else:  # e.g. a backend built before matmul_batched existed
+            a3 = a.reshape((size if a_stride else 1, m, n))
+            b3 = b.reshape((size if b_stride else 1, n, p))
+            for z in range(size):
+                az = a3[z if a_stride else 0, :, :].compact().reshape((m, n))
+                bz = b3[z if b_stride else 0, :, :].compact().reshape((n, p))
+                out[z, :, :] = (az @ bz).reshape((1, m, p))
+        return out.reshape(out_shape)
 
     ### Reductions, i.e., sum/max over all element or over given axis
     def reduce_view_out(self, axis: int | tuple[int, ...] | list[int] | None, keepdims: bool = False) -> tuple["NDArray", "NDArray"]:
@@ -787,6 +852,23 @@ def empty(shape: tuple[int, ...], dtype: str = "float32", device: BackendDevice 
 def full(shape: tuple[int, ...], fill_value: float, dtype: str = "float32", device: BackendDevice | None = None) -> NDArray:
     device = device if device is not None else default_device()
     return device.full(shape, fill_value, dtype)
+
+
+def broadcast_shapes(*shapes: tuple[int, ...]) -> tuple[int, ...]:
+    """numpy broadcasting of shapes (align trailing dimensions; 1 stretches)."""
+    ndim = max((len(s) for s in shapes), default=0)
+    result = []
+    for i in range(ndim):
+        dims = {s[len(s) - ndim + i] for s in shapes if len(s) - ndim + i >= 0}
+        dims.discard(1)
+        if len(dims) > 1:
+            raise ValueError(f"shapes {shapes} cannot be broadcast together")
+        result.append(dims.pop() if dims else 1)
+    return tuple(result)
+
+
+def matmul(a: NDArray, b: NDArray) -> NDArray:
+    return a @ b
 
 
 def broadcast_to(array: NDArray, new_shape: tuple[int, ...]) -> NDArray:

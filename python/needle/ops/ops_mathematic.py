@@ -378,6 +378,10 @@ def summation(a, axes=None):
 
 
 class MatMul(TensorOp):
+    """Matrix product, numpy semantics: (m, n) @ (n, p), and batched
+    (..., m, n) @ (..., n, p) -> (..., m, p) with the leading (batch)
+    dimensions broadcast against each other."""
+
     autocast_policy = AUTOCAST_LOWER
 
     def compute(self, a, b):
@@ -389,26 +393,32 @@ class MatMul(TensorOp):
     def gradient(self, out_grad, node):
         ### BEGIN YOUR SOLUTION
         # raise NotImplementedError()
-        # def sum_to_shape(grad, shape):
-        #     cur_shape = grad.cached_data.shape 
-        #     padded_shape = (1, ) * (len(cur_shape) - len(shape)) + tuple(shape)
-        #     axes = tuple(i for i, (in_dim, out_dim) in enumerate(zip(padded_shape, cur_shape)) 
-        #                     if in_dim == 1 and out_dim != 1) 
-        #     res = summation(grad, axes) 
-        #     return reshape(res, shape) 
-        # lhs, rhs = node.inputs 
-        # grad_lhs = matmul(out_grad, transpose(rhs))
-        # grad_rhs = matmul(transpose(lhs), out_grad)
-        # grad_lhs = sum_to_shape(grad_lhs, lhs.cached_data.shape)
-        # grad_rhs = sum_to_shape(grad_rhs, rhs.cached_data.shape) 
-        # return grad_lhs, grad_rhs
         lhs, rhs = node.inputs
 
+        # transpose() swaps the last two axes, so this covers the batched case too
         grad_lhs = matmul(out_grad, transpose(rhs))
         grad_rhs = matmul(transpose(lhs), out_grad)
 
-        return grad_lhs, grad_rhs
+        # an operand broadcast over batch dimensions receives the sum over them
+        return _sum_to_shape(grad_lhs, lhs.shape), _sum_to_shape(grad_rhs, rhs.shape)
         ### END YOUR SOLUTION
+
+
+def _sum_to_shape(grad, shape):
+    """Sum `grad` over the dimensions that were broadcast to produce it from
+    `shape` (leading extra dimensions, and dimensions of size 1)."""
+    shape = tuple(shape)
+    if tuple(grad.shape) == shape:
+        return grad
+    extra = len(grad.shape) - len(shape)
+    axes = tuple(range(extra)) + tuple(
+        extra + i
+        for i, d in enumerate(shape)
+        if d == 1 and grad.shape[extra + i] != 1
+    )
+    if axes:
+        grad = summation(grad, axes)
+    return reshape(grad, shape)
 
 
 def matmul(a, b):
