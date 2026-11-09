@@ -19,6 +19,28 @@ NDArray = numpy.ndarray
 
 from .backend_selection import array_api, NDArray, default_device, cpu
 
+
+def canonical_dtype(dtype) -> Optional[str]:
+    """Canonical dtype name ("float32", "float16", ...); None stays None.
+
+    Accepts strings, numpy dtypes and numpy scalar types, so "float16",
+    numpy.float16 and numpy.dtype("float16") all compare equal afterwards.
+    """
+    if dtype is None:
+        return None
+    return numpy.dtype(dtype).name
+
+
+def _check_input_dtypes(op: "Op", inputs: List["Value"]) -> None:
+    """Ops compute on a single dtype; mixing float16 and float32 inputs must be
+    an explicit cast rather than a backend assertion deep inside compute()."""
+    dtypes = {x.dtype for x in inputs if isinstance(x, Tensor)}
+    if len(dtypes) > 1:
+        raise TypeError(
+            f"{type(op).__name__} got inputs with different dtypes {sorted(dtypes)}; "
+            "cast explicitly with tensor.astype(dtype) or ops.cast(tensor, dtype)"
+        )
+
 class Op:
     """Operator definition."""
 
@@ -243,6 +265,7 @@ class Tensor(Value):
         requires_grad=True,
         **kwargs
     ):
+        dtype = canonical_dtype(dtype)
         if isinstance(array, Tensor):
             if device is None:
                 device = array.device
@@ -250,6 +273,9 @@ class Tensor(Value):
                 dtype = array.dtype
             if device == array.device and dtype == array.dtype:
                 cached_data = array.realize_cached_data()
+            elif device == array.device:
+                # same device, new dtype: convert on the device
+                cached_data = array.realize_cached_data().astype(dtype)
             else:
                 # fall back, copy through numpy conversion
                 cached_data = Tensor._array_from_numpy(
@@ -274,6 +300,8 @@ class Tensor(Value):
 
     @staticmethod
     def make_from_op(op: Op, inputs: List["Value"]):
+        if not LAZY_MODE:
+            _check_input_dtypes(op, inputs)
         tensor = Tensor.__new__(Tensor)
         tensor._init(op, inputs)
         if not LAZY_MODE:
@@ -335,11 +363,11 @@ class Tensor(Value):
         return self._device
 
     def backward(self, out_grad=None):
-        out_grad = (
-            out_grad
-            if out_grad
-            else init.ones(*self.shape, dtype=self.dtype, device=self.device)
-        )
+        if out_grad is None:
+            out_grad = init.ones(*self.shape, dtype=self.dtype, device=self.device)
+        elif out_grad.dtype != self.dtype:
+            # the adjoint of a tensor always has the tensor's dtype
+            out_grad = needle.ops.cast(out_grad, self.dtype)
         compute_gradient_of_variables(self, out_grad)
 
     def __repr__(self):
@@ -411,6 +439,17 @@ class Tensor(Value):
     __radd__ = __add__
     __rmul__ = __mul__
 
+    ### dtype conversion (differentiable, see ops.Cast)
+    def astype(self, dtype):
+        """Differentiable cast; returns self when the dtype already matches."""
+        return needle.ops.cast(self, dtype)
+
+    def half(self):
+        return self.astype("float16")
+
+    def float(self):
+        return self.astype("float32")
+
 def compute_gradient_of_variables(output_tensor, out_grad):
     """Take gradient of output node with respect to each node in node_list.
 
@@ -438,6 +477,16 @@ def compute_gradient_of_variables(output_tensor, out_grad):
         for i in range(len(prior_grads)):
             prior = each.inputs[i] 
             prior_grad = prior_grads[i] 
+            # Invariant for mixed precision: a node's adjoint has the node's dtype
+            # (so float32 master weights always get float32 grads and partial
+            # adjoints of one node can be summed). Ops' gradients normally ensure
+            # this already; cast any stray contribution instead of failing later.
+            if (
+                isinstance(prior, Tensor)
+                and isinstance(prior_grad, Tensor)
+                and prior_grad.dtype != prior.dtype
+            ):
+                prior_grad = needle.ops.cast(prior_grad, prior.dtype)
             if prior in node_to_output_grads_list:
                 node_to_output_grads_list[prior].append(prior_grad)
             else:

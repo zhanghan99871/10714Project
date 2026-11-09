@@ -6,12 +6,39 @@ from typing import Optional, List, Tuple, Union
 from ..autograd import NDArray
 from ..autograd import Op, Tensor, Value, TensorOp
 from ..autograd import TensorTuple, TensorTupleOp
+from ..autograd import canonical_dtype
 
 # NOTE: we will import numpy as the array_api
 # as the backend for our computations, this line will change in later homeworks
 
 from ..backend_selection import array_api, BACKEND
 from .ops_tuple import *
+
+class Cast(TensorOp):
+    """Convert a tensor to another floating point dtype, e.g. "float16" / "float32".
+
+    float32 -> float16 rounds to nearest even (and saturates to +-inf above 65504);
+    float16 -> float32 is exact. The gradient is treated as the identity and cast
+    back to the *input's* dtype, so a float32 leaf used in a float16 computation
+    (the "master weight" pattern of mixed precision) still gets a float32 .grad.
+    """
+
+    def __init__(self, dtype):
+        self.dtype = canonical_dtype(dtype)
+
+    def compute(self, a: NDArray):
+        return a.astype(self.dtype)
+
+    def gradient(self, out_grad: Tensor, node: Tensor):
+        return cast(out_grad, node.inputs[0].dtype)
+
+
+def cast(a, dtype):
+    """Cast `a` to `dtype`; returns `a` itself when it already has that dtype."""
+    if a.dtype == canonical_dtype(dtype):
+        return a
+    return Cast(dtype)(a)
+
 
 class EWiseAdd(TensorOp):
     def compute(self, a: NDArray, b: NDArray):
@@ -455,12 +482,18 @@ class Stack(TensorOp):
         shape = args[0].shape
         ndim = len(shape) + 1
         axis = self.axis % ndim
+        dtypes = {str(a.dtype) for a in args}
+        if len(dtypes) > 1:
+            raise TypeError(
+                f"stack needs tensors of a single dtype, got {sorted(dtypes)}; "
+                "use .astype() to convert"
+            )
 
         # Insert a new dimension
         new_shape = shape[:axis] + (len(args),) + shape[axis:]
 
         out = array_api.empty(
-            new_shape, device=args[0].device
+            new_shape, dtype=args[0].dtype, device=args[0].device
         )
         for i, a in enumerate(args):
             slices = (
@@ -564,7 +597,7 @@ class Dilate(TensorOp):
         ndim = len(a.shape)
         new_shape = tuple([a.shape[i] * (self.dilation + 1) if i in self.axes else a.shape[i] for i in range(ndim)])
         result = array_api.empty(
-            new_shape, device=a.device
+            new_shape, dtype=a.dtype, device=a.device
         )
         result.fill(0.0)
         new_slice = tuple([slice(None, None, self.dilation+1) if i in self.axes else slice(None) for i in range(ndim)])
