@@ -9,6 +9,7 @@
 #include <iostream>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 namespace needle {
 namespace cpu {
@@ -346,6 +347,35 @@ void EwiseLog(const AlignedArray& a, AlignedArray* out) { EwiseUnary(a, out, OpL
 void EwiseExp(const AlignedArray& a, AlignedArray* out) { EwiseUnary(a, out, OpExp()); }
 void EwiseTanh(const AlignedArray& a, AlignedArray* out) { EwiseUnary(a, out, OpTanh()); }
 
+/**
+ * The one (naive) matmul loop shared by Matmul and MatmulBatched: out[z] = a[z] @ b[z].
+ *
+ * Both entry points call this single non-inlined function, so a batched product is
+ * bit-identical to the 2D product of each slice *by construction*: whether the compiler
+ * fuses `tmp += a * b` into a fused multiply-add (one rounding instead of two) depends on
+ * the compiler, its version and the target CPU, and could otherwise differ between two
+ * separately written loops.
+ */
+template <typename T>
+__attribute__((noinline)) void MatmulLoop(const T* pa, const T* pb, T* po, size_t batch,
+                                          size_t m, size_t n, size_t p, size_t a_batch_stride,
+                                          size_t b_batch_stride) {
+  for (size_t z = 0; z < batch; z++) {
+    const T* az = pa + z * a_batch_stride;
+    const T* bz = pb + z * b_batch_stride;
+    T* oz = po + z * m * p;
+    for (size_t i = 0; i < m; i++) {
+      for (size_t j = 0; j < p; j++) {
+        float tmp = 0;
+        for (size_t k = 0; k < n; k++) {
+          tmp += Load(az, i * n + k) * Load(bz, k * p + j);
+        }
+        Store(oz, i * p + j, tmp);
+      }
+    }
+  }
+}
+
 void Matmul(const AlignedArray& a, const AlignedArray& b, AlignedArray* out, uint32_t m, uint32_t n,
             uint32_t p) {
   /**
@@ -363,18 +393,31 @@ void Matmul(const AlignedArray& a, const AlignedArray& b, AlignedArray* out, uin
   CheckSameDType(a, b);
   CheckSameDType(a, *out);
   NEEDLE_DISPATCH(a.dtype, T, {
-    const T* pa = a.as<T>();
-    const T* pb = b.as<T>();
-    T* po = out->as<T>();
-    for (size_t i = 0; i < m; i++) {
-      for (size_t j = 0; j < p; j++) {
-        float tmp = 0;
-        for (size_t k = 0; k < n; k++) {
-          tmp += Load(pa, i * n + k) * Load(pb, k * p + j);
-        }
-        Store(po, i * p + j, tmp);
-      }
-    }
+    MatmulLoop(a.as<T>(), b.as<T>(), out->as<T>(), 1, m, n, p, 0, 0);
+  });
+}
+
+void MatmulBatched(const AlignedArray& a, const AlignedArray& b, AlignedArray* out,
+                   uint32_t batch, uint32_t m, uint32_t n, uint32_t p, size_t a_batch_stride,
+                   size_t b_batch_stride) {
+  /**
+   * Batched matrix multiplication: out[z] = a[z] @ b[z] for z < batch.
+   *
+   * Args:
+   *   a: compact array holding the m x n matrices of a; matrix z starts at z * a_batch_stride
+   *   b: compact array holding the n x p matrices of b; matrix z starts at z * b_batch_stride
+   *   out: compact batch x m x p array
+   *   a_batch_stride / b_batch_stride: elements between consecutive matrices (m * n or n * p),
+   *     or 0 for a single matrix shared by the whole batch (broadcasting, no copy needed)
+   *
+   * Runs the same compiled loop as Matmul (MatmulLoop), so every batch entry equals the
+   * (naive) 2D matmul of that slice bit for bit. float16 accumulates in float32.
+   */
+  CheckSameDType(a, b);
+  CheckSameDType(a, *out);
+  NEEDLE_DISPATCH(a.dtype, T, {
+    MatmulLoop(a.as<T>(), b.as<T>(), out->as<T>(), batch, m, n, p, a_batch_stride,
+               b_batch_stride);
   });
 }
 
@@ -597,6 +640,7 @@ PYBIND11_MODULE(ndarray_backend_cpu, m) {
 
   m.def("matmul", Matmul);
   m.def("matmul_tiled", MatmulTiled);
+  m.def("matmul_batched", MatmulBatched);
 
   m.def("reduce_max", ReduceMax);
   m.def("reduce_sum", ReduceSum);
