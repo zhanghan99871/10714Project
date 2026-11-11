@@ -503,6 +503,12 @@ class Tensor(Value):
         else:
             return needle.ops.AddScalar(-other)(self)
 
+    def __rsub__(self, other):
+        return needle.ops.AddScalar(other)(needle.ops.Negate()(self))
+
+    def __rtruediv__(self, other):
+        return needle.ops.RDivScalar(other)(self)
+
     def __truediv__(self, other):
         if isinstance(other, Tensor):
             return needle.ops.EWiseDiv()(self, other)

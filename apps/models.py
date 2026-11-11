@@ -119,11 +119,3 @@ class LanguageModel(nn.Module):
         return out, h 
         ### END YOUR SOLUTION
 
-
-if __name__ == "__main__":
-    model = ResNet9()
-    x = ndl.ops.randu((1, 32, 32, 3), requires_grad=True)
-    model(x)
-    cifar10_train_dataset = ndl.data.CIFAR10Dataset("data/cifar-10-batches-py", train=True)
-    train_loader = ndl.data.DataLoader(cifar10_train_dataset, 128, ndl.cpu(), dtype="float32")
-    print(cifar10_train_dataset[1][0].shape)

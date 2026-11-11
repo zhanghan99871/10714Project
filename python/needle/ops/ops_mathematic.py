@@ -233,6 +233,17 @@ class DivScalar(TensorOp):
 def divide_scalar(a, scalar):
     return DivScalar(scalar)(a)
 
+class RDivScalar(TensorOp):
+
+    def __init__(self, scalar):
+        self.scalar = scalar
+
+    def compute(self, a):
+        return self.scalar / a
+
+    def gradient(self, out_grad, node):
+        a = node.inputs[0]
+        return negate(out_grad * node / a)
 
 class Transpose(TensorOp):
     def __init__(self, axes: Optional[tuple] = None):

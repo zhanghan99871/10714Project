@@ -835,6 +835,12 @@ class NDArray:
         return result 
         ### END YOUR SOLUTION
 
+    def __rtruediv__(self, other: float) -> "NDArray":
+        """scalar / array: one division per element."""
+        numerator = NDArray.make(self.shape, device=self.device, dtype=self.dtype)
+        numerator.fill(other)
+        return numerator / self
+
 def array(a: Any, dtype: str | None = None, device: BackendDevice | None = None) -> NDArray:
     """Convenience methods to match numpy a bit more closely.
 
