@@ -211,13 +211,13 @@ def test_input_reused_after_cast_is_recomputed(device):
 def test_gradients_are_not_released(device):
     """Casts inside backward (Cast.gradient, dtype fix-ups) never release gradients."""
     W = T(np.full((3, 2), 0.5, f32), device)
-    # X requires grad, so the adjoints built from it are graph intermediates
-    # (non-leaves) that a release would actually free
+    # X requires grad and the gradient graph is recorded (create_graph=True), so
+    # the adjoints are graph intermediates (non-leaves) that a release would free
     X = T(np.ones((4, 3), f16), device)
     W16 = W.half()
     out = X @ W16
     loss = ops.summation(out.float())
-    loss.backward()
+    loss.backward(create_graph=True)
     assert W.grad.dtype == "float32" and W.grad.cached_data is not None
     # the float16 adjoints that Cast.gradient casts back are kept as well
     assert W16.grad.dtype == "float16" and W16.grad.cached_data is not None
