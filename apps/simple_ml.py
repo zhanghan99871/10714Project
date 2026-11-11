@@ -146,6 +146,12 @@ def _amp_context(amp):
     return ndl.autocast() if amp else contextlib.nullcontext()
 
 
+def _grad_context(opt):
+    """Evaluation (no optimizer) records no graph: activations are freed during
+    the forward pass instead of living until the end of the batch."""
+    return contextlib.nullcontext() if opt is not None else ndl.no_grad()
+
+
 def _make_scaler(amp, opt, scaler):
     """The GradScaler for an epoch: the caller's, or a new one when training
     with amp, or a disabled (pass-through) one."""
@@ -203,7 +209,7 @@ def epoch_general_cifar10(dataloader, model, loss_fn=nn.SoftmaxLoss(), opt=None,
         X = ndl.Tensor(X, device=device, requires_grad=False)
         y = ndl.Tensor(y, device=device, requires_grad=False)
         batch_size = X.shape[0] 
-        with _amp_context(amp):
+        with _grad_context(opt), _amp_context(amp):
             output = model(X) 
             loss = loss_fn(output, y) 
         if opt is not None: 
@@ -216,6 +222,9 @@ def epoch_general_cifar10(dataloader, model, loss_fn=nn.SoftmaxLoss(), opt=None,
         total_correct += np.sum(predictions == labels)
         total_loss += loss.numpy().item() * batch_size
         total_samples += batch_size
+        # drop this batch's graph now; otherwise it stays alive (through `output`
+        # and `loss`) during the next batch's forward pass, doubling peak memory
+        del output, loss
 
     avg_acc = total_correct / total_samples
     avg_loss = total_loss / total_samples
@@ -325,7 +334,7 @@ def epoch_general_ptb(data, model, seq_len=40, loss_fn=nn.SoftmaxLoss(), opt=Non
     scaler = _make_scaler(amp, opt, scaler)
     for i in range(0, data.shape[0] - 1, seq_len):
         X, y = get_batch(data, i, seq_len, device=device, dtype=dtype)
-        with _amp_context(amp):
+        with _grad_context(opt), _amp_context(amp):
             output, h = model(X, h) 
             loss = loss_fn(output, y) 
         if opt is not None: 
@@ -343,6 +352,7 @@ def epoch_general_ptb(data, model, seq_len=40, loss_fn=nn.SoftmaxLoss(), opt=Non
         total_correct += np.sum(predictions == labels)
         total_loss += loss.numpy().item() * num_tokens
         total_samples += num_tokens
+        del output, loss  # see epoch_general_cifar10
 
     avg_acc = total_correct / total_samples
     avg_loss = total_loss / total_samples

@@ -4,6 +4,7 @@ from .backend_numpy import Device, all_devices
 from typing import List, Optional, NamedTuple, Tuple, Union, Dict, TYPE_CHECKING
 from collections import namedtuple
 import numpy
+import contextlib
 
 from needle import init
 
@@ -78,7 +79,9 @@ def _autocast_cast(x: "Tensor", dtype: str) -> "Tensor":
     not converted again for each step. The cache entry is invalidated when the
     leaf's data is replaced (e.g. by an optimizer step inside the region)."""
     if _AUTOCAST.cache_enabled and x.is_leaf() and x.requires_grad:
-        key = (id(x), dtype)
+        # grad mode is part of the key: a cast made under no_grad is a detached
+        # constant, and reusing it with grad enabled would cut the parameter off
+        key = (id(x), dtype, _GRAD_MODE.enabled)
         hit = _AUTOCAST.cache.get(key)
         if hit is not None and hit[0] is x and hit[1] is x.cached_data:
             return hit[2]
@@ -120,6 +123,65 @@ def autocast_promote(tensors: List["Tensor"]) -> List["Tensor"]:
         return list(tensors)
     target = _widest_dtype(dtypes)
     return [_autocast_cast(t, target) if t.dtype != target else t for t in tensors]
+
+
+##############################
+######### Grad mode ##########
+##############################
+
+
+class _GradMode:
+    """Whether ops record the graph (managed by no_grad / enable_grad / set_grad_enabled)."""
+
+    def __init__(self):
+        self.enabled = True
+
+
+_GRAD_MODE = _GradMode()
+
+
+def is_grad_enabled() -> bool:
+    """True when ops record the computational graph (the default)."""
+    return _GRAD_MODE.enabled
+
+
+class set_grad_enabled(contextlib.ContextDecorator):
+    """Context manager / decorator that turns graph recording on (True) or off (False).
+
+    With recording off, every op result is a detached constant (requires_grad=False,
+    no inputs), so nothing keeps its inputs alive: activations are freed as soon as
+    the code no longer references them. Leaf tensors created explicitly keep the
+    requires_grad they are given. Nestable and re-entrant; the previous mode is
+    restored on exit, also when an exception is raised.
+    """
+
+    def __init__(self, mode: bool):
+        self.mode = bool(mode)
+        self._saved = []
+
+    def __enter__(self):
+        self._saved.append(_GRAD_MODE.enabled)
+        _GRAD_MODE.enabled = self.mode
+        return self
+
+    def __exit__(self, *exc):
+        _GRAD_MODE.enabled = self._saved.pop()
+        return False
+
+
+class no_grad(set_grad_enabled):
+    """`with ndl.no_grad():` / `@ndl.no_grad()` -- inference and evaluation without
+    building a graph."""
+
+    def __init__(self):
+        super().__init__(False)
+
+
+class enable_grad(set_grad_enabled):
+    """Turn graph recording back on inside a no_grad region."""
+
+    def __init__(self):
+        super().__init__(True)
 
 
 class _AutocastDisabled:
@@ -279,7 +341,9 @@ class Value:
         global TENSOR_COUNTER
         TENSOR_COUNTER += 1
         if requires_grad is None:
-            requires_grad = any(x.requires_grad for x in inputs)
+            # under no_grad nothing created by an op requires grad (leaves created
+            # explicitly keep the requires_grad they are given)
+            requires_grad = _GRAD_MODE.enabled and any(x.requires_grad for x in inputs)
         self.op = op
         self.inputs = inputs
         self.num_outputs = num_outputs
@@ -459,13 +523,26 @@ class Tensor(Value):
             self.realize_cached_data()
         return self._device
 
-    def backward(self, out_grad=None):
+    def backward(self, out_grad=None, create_graph=False):
+        """Compute the gradient of this tensor w.r.t. every tensor in its graph
+        that requires grad, and store it in their .grad.
+
+        create_graph=False (default): the gradient computation itself is not
+        recorded, so every .grad is a plain tensor that does not reference (and
+        keep alive) the forward activations. create_graph=True records it, which
+        is only needed for higher-order derivatives (differentiating a .grad).
+        """
+        if not self.requires_grad:
+            raise RuntimeError(
+                "backward() on a tensor that does not require grad: it was created "
+                "under no_grad, or from tensors none of which require grad"
+            )
         if out_grad is None:
             out_grad = init.ones(*self.shape, dtype=self.dtype, device=self.device)
         elif out_grad.dtype != self.dtype:
             # the adjoint of a tensor always has the tensor's dtype
             out_grad = needle.ops.cast(out_grad, self.dtype, release_input=False)
-        compute_gradient_of_variables(self, out_grad)
+        compute_gradient_of_variables(self, out_grad, create_graph=create_graph)
 
     def __repr__(self):
         return "needle.Tensor(" + str(self.realize_cached_data()) + ")"
@@ -557,7 +634,7 @@ class Tensor(Value):
     def float(self, release_input: bool = True):
         return self.astype("float32", release_input=release_input)
 
-def compute_gradient_of_variables(output_tensor, out_grad):
+def compute_gradient_of_variables(output_tensor, out_grad, create_graph=False):
     """Take gradient of output node with respect to each node in node_list.
 
     Store the computed result in the grad field of each Variable.
@@ -565,8 +642,11 @@ def compute_gradient_of_variables(output_tensor, out_grad):
     Autocast is suspended while the gradient graph is built: every gradient op
     runs in the dtypes the forward pass chose, whether or not backward() is
     called inside an autocast region.
+
+    Gradient ops are recorded only with create_graph=True (independently of the
+    surrounding grad mode); by default every gradient is a detached tensor.
     """
-    with _AutocastDisabled():
+    with _AutocastDisabled(), set_grad_enabled(create_graph):
         _compute_gradient_of_variables(output_tensor, out_grad)
 
 

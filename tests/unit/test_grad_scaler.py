@@ -212,7 +212,7 @@ def test_unscale_detaches_gradient_graph(device):
     X = T(np.ones((3, 2), f32), device)  # requires grad: W.grad is a graph node
     opt = ndl.optim.SGD([W], lr=0.1)
     sc = ndl.amp.GradScaler(init_scale=4.0)
-    sc.scale(ops.summation(X @ W)).backward()
+    sc.scale(ops.summation(X @ W)).backward(create_graph=True)  # .grad is a graph node
     assert not W.grad.is_leaf()
     sc.unscale_(opt)
     assert W.grad.is_leaf() and not W.grad.requires_grad
