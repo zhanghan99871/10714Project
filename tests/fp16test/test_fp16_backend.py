@@ -110,7 +110,7 @@ def test_mixed_dtype_rejected(device):
 
 @pytest.mark.parametrize("device", _DEVICES, ids=_IDS)
 def test_backend_advertises_float16(device):
-    assert device.dtypes == ("float32", "float16")
+    assert {"float32", "float16"} <= set(device.dtypes)
     assert device.supports_dtype("float16") and device.supports_dtype(np.float32)
 
 

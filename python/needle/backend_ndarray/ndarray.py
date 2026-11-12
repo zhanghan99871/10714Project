@@ -15,16 +15,44 @@ def prod(x: Iterable[int]) -> int:
 
 
 # Element types NDArray knows about. A backend advertises what it implements through a
-# module-level ``__dtypes__`` tuple; backends without it (e.g. the numpy backend) are
-# float32-only. float16 is a storage type: the native backends compute in float32.
-SUPPORTED_DTYPES = ("float32", "float16")
+# module-level ``__dtypes__`` tuple; backends without it (e.g. older builds) are
+# float32-only. float16 and bfloat16 are storage types: the backends compute in float32.
+# numpy has no bfloat16: such arrays use ml_dtypes.bfloat16 (pip install ml_dtypes),
+# which is imported only when bfloat16 is actually used.
+SUPPORTED_DTYPES = ("float32", "float16", "bfloat16")
+
+
+def bfloat16_type() -> Any:
+    """The numpy scalar type for bfloat16 (ml_dtypes.bfloat16)."""
+    try:
+        import ml_dtypes
+    except ImportError as e:  # pragma: no cover - depends on the environment
+        raise ImportError(
+            "bfloat16 needs the ml_dtypes package: pip install ml_dtypes"
+        ) from e
+    return ml_dtypes.bfloat16
+
+
+def numpy_dtype(dtype: Any) -> np.dtype:
+    """numpy dtype object for a needle dtype (bfloat16 -> ml_dtypes.bfloat16)."""
+    name = normalize_dtype(dtype)
+    return np.dtype(bfloat16_type()) if name == "bfloat16" else np.dtype(name)
 
 
 def normalize_dtype(dtype: Any) -> str:
-    """Canonical dtype name ("float32" / "float16"); None means float32."""
+    """Canonical dtype name ("float32" / "float16" / "bfloat16"); None means float32.
+
+    Accepts names, numpy dtypes and scalar types, including ml_dtypes.bfloat16;
+    the string "bfloat16" works without importing ml_dtypes.
+    """
     if dtype is None:
         return "float32"
-    name = np.dtype(dtype).name
+    if isinstance(dtype, str) and dtype == "bfloat16":
+        return "bfloat16"
+    try:
+        name = np.dtype(dtype).name
+    except TypeError:
+        name = None
     if name not in SUPPORTED_DTYPES:
         raise TypeError(f"unsupported dtype {dtype!r}; expected one of {SUPPORTED_DTYPES}")
     return name
@@ -60,15 +88,15 @@ class BackendDevice:
     def randn(self, *shape: int, dtype: str = "float32") -> "NDArray":
         # note: numpy doesn't support types within standard random routines, and
         # .astype("float32") does work if we're generating a singleton
-        return NDArray(np.random.randn(*shape).astype(dtype), device=self, dtype=dtype)
+        return NDArray(np.random.randn(*shape).astype(numpy_dtype(dtype)), device=self, dtype=dtype)
 
     def rand(self, *shape: int, dtype: str = "float32") -> "NDArray":
         # note: numpy doesn't support types within standard random routines, and
         # .astype("float32") does work if we're generating a singleton
-        return NDArray(np.random.rand(*shape).astype(dtype), device=self, dtype=dtype)
+        return NDArray(np.random.rand(*shape).astype(numpy_dtype(dtype)), device=self, dtype=dtype)
 
     def one_hot(self, n: int, i: int, dtype: str = "float32") -> "NDArray":
-        return NDArray(np.eye(n, dtype=dtype)[i], device=self, dtype=dtype)
+        return NDArray(np.eye(n, dtype=numpy_dtype(dtype))[i], device=self, dtype=dtype)
 
     def empty(self, shape: tuple[int, ...], dtype: str = "float32") -> "NDArray":
         return NDArray.make(shape, device=self, dtype=dtype)
@@ -145,10 +173,14 @@ class NDArray:
             # create copy from numpy array
             device = device if device is not None else default_device()
             if dtype is None:
-                dtype = "float16" if other.dtype == np.float16 else "float32"
+                # keep the half precision types, everything else becomes float32
+                dtype = other.dtype.name if other.dtype.name in ("float16", "bfloat16") else "float32"
             dtype = normalize_dtype(dtype)
             array = self.make(other.shape, device=device, dtype=dtype)
-            array.device.from_numpy(np.ascontiguousarray(other, dtype=dtype), array._handle)
+            data = np.ascontiguousarray(other, dtype=numpy_dtype(dtype))
+            if dtype == "bfloat16":
+                data = data.view(np.uint16)  # backends exchange bfloat16 as bit patterns
+            array.device.from_numpy(data, array._handle)
             self._init(array)
         else:
             # see if we can create a numpy array from input
@@ -227,7 +259,7 @@ class NDArray:
 
     @property
     def itemsize(self) -> int:
-        return np.dtype(self._dtype).itemsize
+        return 2 if self._dtype == "bfloat16" else np.dtype(self._dtype).itemsize
 
     @property
     def ndim(self) -> int:
@@ -274,10 +306,13 @@ class NDArray:
         return out
 
     def numpy(self) -> np.ndarray:
-        """convert to a numpy array"""
-        return self.device.to_numpy(
+        """convert to a numpy array (bfloat16 -> ml_dtypes.bfloat16)"""
+        out = self.device.to_numpy(
             self._handle, self.shape, self.strides, self._offset
         )
+        if self._dtype == "bfloat16" and out.dtype == np.uint16:
+            out = out.view(bfloat16_type())  # native backends return bit patterns
+        return out
 
     def is_compact(self) -> bool:
         """Return true if array is compact in memory and internal size equals product

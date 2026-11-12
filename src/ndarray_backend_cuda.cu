@@ -1,3 +1,4 @@
+#include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <pybind11/numpy.h>
@@ -28,23 +29,43 @@ namespace cuda {
  * their accumulators in float. Only the __half <-> float conversion intrinsics are used, so this
  * works on every architecture (no native half arithmetic, which needs sm_53+, is required).
  */
-enum class DType { F32, F16 };
+enum class DType { F32, F16, BF16 };
 
-inline size_t ElemSize(DType dt) { return dt == DType::F32 ? sizeof(float) : sizeof(__half); }
+inline size_t ElemSize(DType dt) { return dt == DType::F32 ? sizeof(float) : sizeof(uint16_t); }
 
-inline const char* DTypeName(DType dt) { return dt == DType::F32 ? "float32" : "float16"; }
+inline const char* DTypeName(DType dt) {
+  switch (dt) {
+    case DType::F32: return "float32";
+    case DType::F16: return "float16";
+    default: return "bfloat16";
+  }
+}
+
+/// numpy dtype used to exchange data with Python. numpy has no built-in bfloat16, so bfloat16
+/// buffers travel as their uint16 bit patterns (Python views them as ml_dtypes.bfloat16).
+inline const char* TransferDTypeName(DType dt) {
+  return dt == DType::BF16 ? "uint16" : DTypeName(dt);
+}
 
 inline DType ParseDType(const std::string& name) {
   if (name == "float32") return DType::F32;
   if (name == "float16") return DType::F16;
+  if (name == "bfloat16") return DType::BF16;
   throw std::invalid_argument("unsupported dtype: " + name);
 }
 
 /// Element access used by every kernel: compute in float, store in the array's type.
 __device__ __forceinline__ float Load(const float* p, size_t i) { return p[i]; }
 __device__ __forceinline__ float Load(const __half* p, size_t i) { return __half2float(p[i]); }
+__device__ __forceinline__ float Load(const __nv_bfloat16* p, size_t i) {
+  return __bfloat162float(p[i]);
+}
 __device__ __forceinline__ void Store(float* p, size_t i, float v) { p[i] = v; }
 __device__ __forceinline__ void Store(__half* p, size_t i, float v) { p[i] = __float2half(v); }
+// __float2bfloat16 rounds to nearest even (software conversion below sm_80)
+__device__ __forceinline__ void Store(__nv_bfloat16* p, size_t i, float v) {
+  p[i] = __float2bfloat16(v);
+}
 
 struct CudaArray {
   CudaArray(const size_t size, const std::string& dtype = "float32")
@@ -56,6 +77,7 @@ struct CudaArray {
   size_t ptr_as_int() { return (size_t)ptr; }
   size_t itemsize() const { return ElemSize(dtype); }
   std::string dtype_name() const { return DTypeName(dtype); }
+  std::string transfer_dtype_name() const { return TransferDTypeName(dtype); }
 
   template <typename T>
   T* as() {
@@ -81,6 +103,11 @@ struct CudaArray {
     }                                  \
     case DType::F16: {                 \
       typedef __half T;                \
+      __VA_ARGS__;                     \
+      break;                           \
+    }                                  \
+    case DType::BF16: {                \
+      typedef __nv_bfloat16 T;         \
       __VA_ARGS__;                     \
       break;                           \
     }                                  \
@@ -557,7 +584,7 @@ PYBIND11_MODULE(ndarray_backend_cuda, m) {
 
   m.attr("__device_name__") = "cuda";
   m.attr("__tile_size__") = TILE;
-  m.attr("__dtypes__") = py::make_tuple("float32", "float16");
+  m.attr("__dtypes__") = py::make_tuple("float32", "float16", "bfloat16");
 
   py::class_<CudaArray>(m, "Array")
       .def(py::init<size_t, std::string>(), py::arg("size"), py::arg("dtype") = "float32",
@@ -586,15 +613,18 @@ PYBIND11_MODULE(ndarray_backend_cuda, m) {
 
     // return numpy array
     py::capsule deallocate_buffer(host_ptr, [](void* p) { free(p); });
-    return py::array(py::dtype(a.dtype_name()), shape, numpy_strides, host_ptr + offset * elem,
+    // bfloat16 comes back as uint16 bit patterns (see TransferDTypeName)
+    return py::array(py::dtype(a.transfer_dtype_name()), shape, numpy_strides, host_ptr + offset * elem,
                      deallocate_buffer);
   });
 
   // copy numpy array to GPU; the array must be C-contiguous with out's dtype
+  // (for bfloat16: its uint16 bit patterns, or an ml_dtypes.bfloat16 array)
   m.def("from_numpy", [](py::array a, CudaArray* out) {
-    if (std::string(py::str(a.dtype())) != out->dtype_name()) {
+    const std::string got = py::str(a.dtype());
+    if (got != out->dtype_name() && got != out->transfer_dtype_name()) {
       throw std::invalid_argument("from_numpy: expected " + out->dtype_name() + " array, got " +
-                                  std::string(py::str(a.dtype())));
+                                  got);
     }
     if (!(a.flags() & py::array::c_style)) {
       throw std::invalid_argument("from_numpy: array must be C-contiguous");
