@@ -22,14 +22,28 @@ from .backend_selection import array_api, NDArray, default_device, cpu
 
 
 def canonical_dtype(dtype) -> Optional[str]:
-    """Canonical dtype name ("float32", "float16", ...); None stays None.
+    """Canonical dtype name ("float32", "float16", "bfloat16", ...); None stays None.
 
     Accepts strings, numpy dtypes and numpy scalar types, so "float16",
     numpy.float16 and numpy.dtype("float16") all compare equal afterwards.
+    "bfloat16" is understood without ml_dtypes (numpy itself has no bfloat16);
+    ml_dtypes.bfloat16 and its numpy dtype are accepted too.
     """
     if dtype is None:
         return None
+    if isinstance(dtype, str) and dtype == "bfloat16":
+        return "bfloat16"
     return numpy.dtype(dtype).name
+
+
+def numpy_dtype(dtype):
+    """numpy dtype object for a dtype name (bfloat16 -> ml_dtypes.bfloat16)."""
+    name = canonical_dtype(dtype)
+    if name == "bfloat16":
+        from .backend_ndarray.ndarray import bfloat16_type
+
+        return numpy.dtype(bfloat16_type())
+    return numpy.dtype(name)
 
 
 def _check_input_dtypes(op: "Op", inputs: List["Value"]) -> None:
@@ -69,8 +83,26 @@ class _AutocastState:
 _AUTOCAST = _AutocastState()
 
 
+# Half precision types that cannot represent each other's values: float16 has more
+# mantissa bits, bfloat16 a wider exponent. Mixing them promotes to float32.
+_HALF_TYPES = ("float16", "bfloat16")
+
+
 def _widest_dtype(dtypes) -> str:
-    return max(dtypes, key=lambda d: (numpy.dtype(d).itemsize, d))
+    """The dtype mixed inputs are promoted to: the widest one, except that
+    float16 and bfloat16 together promote to float32 (as in PyTorch)."""
+    dtypes = set(dtypes)
+    if len(dtypes) == 1:
+        return dtypes.pop()
+    if set(_HALF_TYPES) <= dtypes and not any(
+        d not in _HALF_TYPES and _itemsize(d) > 2 for d in dtypes
+    ):
+        return "float32"
+    return max(dtypes, key=lambda d: (_itemsize(d), d != "bfloat16", d))
+
+
+def _itemsize(dtype) -> int:
+    return 2 if dtype == "bfloat16" else numpy.dtype(dtype).itemsize
 
 
 def _autocast_cast(x: "Tensor", dtype: str) -> "Tensor":
@@ -454,7 +486,7 @@ class Tensor(Value):
     @staticmethod
     def _array_from_numpy(numpy_array, device, dtype):
         if array_api is numpy:
-            return numpy.array(numpy_array, dtype=dtype)
+            return numpy.array(numpy_array, dtype=None if dtype is None else numpy_dtype(dtype))
         return array_api.array(numpy_array, device=device, dtype=dtype)
 
     @staticmethod
@@ -631,6 +663,9 @@ class Tensor(Value):
     def half(self, release_input: bool = True):
         return self.astype("float16", release_input=release_input)
 
+    def bfloat16(self, release_input: bool = True):
+        return self.astype("bfloat16", release_input=release_input)
+
     def float(self, release_input: bool = True):
         return self.astype("float32", release_input=release_input)
 
@@ -651,18 +686,21 @@ def compute_gradient_of_variables(output_tensor, out_grad, create_graph=False):
 
 
 def _sum_adjoints(grads: List["Value"]) -> "Value":
-    """Sum the partial adjoints of one node. float16 adjoints are accumulated in
-    float32 and rounded once (a float16 running sum loses precision quickly, e.g.
-    a weight cast once per autocast region and used at every RNN time step)."""
+    """Sum the partial adjoints of one node. float16 / bfloat16 adjoints are
+    accumulated in float32 and rounded once (a half precision running sum loses
+    precision quickly -- bfloat16 stops counting at 256 -- e.g. for a weight cast
+    once per autocast region and used at every RNN time step)."""
     if (
         len(grads) > 1
         and isinstance(grads[0], Tensor)
-        and grads[0].dtype == "float16"
+        and grads[0].dtype in _HALF_TYPES
     ):
         total = sum_node_list(
             [needle.ops.cast(g, "float32", release_input=False) for g in grads]
         )
-        return needle.ops.cast(total, "float16", release_input=False)
+        # back to the adjoints' own half type (all partial adjoints of a node
+        # share its dtype, see compute_gradient_of_variables)
+        return needle.ops.cast(total, grads[0].dtype, release_input=False)
     return sum_node_list(grads)
 
 

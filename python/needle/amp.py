@@ -1,6 +1,6 @@
 """Automatic mixed precision.
 
-    with ndl.autocast():                 # float16 by default
+    with ndl.autocast():                 # float16 by default; dtype="bfloat16" too
         logits = model(x)
         loss = loss_fn(logits, y)
     loss.backward()                      # inside or outside the region: same result
@@ -25,6 +25,14 @@ the outermost region exits.
 
 Autocast is ignored in LAZY_MODE, and never applies while gradients are
 computed: backward ops run in the dtypes chosen by the forward pass.
+
+bfloat16
+--------
+``autocast(dtype="bfloat16")`` runs the "lower" ops in bfloat16 (8 exponent bits
+like float32, 8 significant bits). It needs no loss scaling: gradients do not
+underflow or overflow any sooner than in float32. It rounds about 8x more coarsely
+than float16, so expect larger deviations from float32. Mixing float16 and
+bfloat16 inputs promotes to float32 (neither holds the other's values).
 
 Loss scaling (float16 only)
 ---------------------------
@@ -54,7 +62,7 @@ from .autograd import canonical_dtype
 
 __all__ = ["autocast", "is_autocast_enabled", "get_autocast_dtype", "GradScaler"]
 
-_SUPPORTED = ("float16", "float32")
+_SUPPORTED = ("float16", "bfloat16", "float32")
 
 
 class autocast(contextlib.ContextDecorator):
