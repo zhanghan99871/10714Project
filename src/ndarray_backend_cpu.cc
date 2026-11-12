@@ -21,24 +21,42 @@ namespace cpu {
  * Supported element types.
  *
  * float32 is stored and computed natively. float16 (IEEE 754 binary16, the same format as
- * numpy.float16) is a *storage* type: every kernel loads float16 elements, widens them to
- * float32, computes in float32 and rounds the result back to float16 (round-to-nearest-even).
+ * numpy.float16) and bfloat16 (the upper 16 bits of a float32: same 8-bit exponent, 7-bit
+ * mantissa; ml_dtypes.bfloat16 in numpy) are *storage* types: every kernel loads them, widens
+ * them to float32, computes in float32 and rounds the result back once (round-to-nearest-even).
  * In particular matmul and reductions always accumulate in float32, which is what mixed
  * precision training needs.
  */
-enum class DType { F32, F16 };
+enum class DType { F32, F16, BF16 };
 
 struct half_t {
   uint16_t bits;
 };
 
-inline size_t ElemSize(DType dt) { return dt == DType::F32 ? sizeof(float) : sizeof(half_t); }
+struct bf16_t {
+  uint16_t bits;
+};
 
-inline const char* DTypeName(DType dt) { return dt == DType::F32 ? "float32" : "float16"; }
+inline size_t ElemSize(DType dt) { return dt == DType::F32 ? sizeof(float) : sizeof(uint16_t); }
+
+inline const char* DTypeName(DType dt) {
+  switch (dt) {
+    case DType::F32: return "float32";
+    case DType::F16: return "float16";
+    default: return "bfloat16";
+  }
+}
+
+/// numpy dtype used to exchange data with Python. numpy has no built-in bfloat16, so bfloat16
+/// buffers travel as their uint16 bit patterns (Python views them as ml_dtypes.bfloat16).
+inline const char* TransferDTypeName(DType dt) {
+  return dt == DType::BF16 ? "uint16" : DTypeName(dt);
+}
 
 inline DType ParseDType(const std::string& name) {
   if (name == "float32") return DType::F32;
   if (name == "float16") return DType::F16;
+  if (name == "bfloat16") return DType::BF16;
   throw std::invalid_argument("unsupported dtype: " + name);
 }
 
@@ -94,11 +112,26 @@ inline float HalfToFloat(uint16_t h) {
   return bits_to_float(o | ((uint32_t)(h & 0x8000u) << 16));
 }
 
+/// float32 <-> bfloat16. bfloat16 is the upper half of a float32, so widening is exact.
+inline float BF16ToFloat(uint16_t b) { return bits_to_float((uint32_t)b << 16); }
+
+/// Round to nearest even on the 16 dropped bits (overflow carries into the exponent and gives
+/// +-inf, like ml_dtypes); NaN is kept a quiet NaN instead of being rounded (which could turn a
+/// NaN with only low payload bits into inf).
+inline uint16_t FloatToBF16(float value) {
+  uint32_t u = float_to_bits(value);
+  if ((u & 0x7fffffffu) > 0x7f800000u) return (uint16_t)((u >> 16) | 0x0040u);
+  u += 0x7fffu + ((u >> 16) & 1u);
+  return (uint16_t)(u >> 16);
+}
+
 /// Element access: every kernel reads and writes through these, computing in float.
 inline float Load(const float* p, size_t i) { return p[i]; }
 inline float Load(const half_t* p, size_t i) { return HalfToFloat(p[i].bits); }
+inline float Load(const bf16_t* p, size_t i) { return BF16ToFloat(p[i].bits); }
 inline void Store(float* p, size_t i, float v) { p[i] = v; }
 inline void Store(half_t* p, size_t i, float v) { p[i].bits = FloatToHalf(v); }
+inline void Store(bf16_t* p, size_t i, float v) { p[i].bits = FloatToBF16(v); }
 
 /**
  * This is a utility structure for maintaining an array aligned to ALIGNMENT boundaries in
@@ -115,6 +148,7 @@ struct AlignedArray {
   size_t ptr_as_int() { return (size_t)ptr; }
   size_t itemsize() const { return ElemSize(dtype); }
   std::string dtype_name() const { return DTypeName(dtype); }
+  std::string transfer_dtype_name() const { return TransferDTypeName(dtype); }
 
   template <typename T>
   T* as() {
@@ -140,6 +174,11 @@ struct AlignedArray {
     }                                  \
     case DType::F16: {                 \
       typedef half_t T;                \
+      __VA_ARGS__;                     \
+      break;                           \
+    }                                  \
+    case DType::BF16: {                \
+      typedef bf16_t T;                \
       __VA_ARGS__;                     \
       break;                           \
     }                                  \
@@ -577,7 +616,7 @@ PYBIND11_MODULE(ndarray_backend_cpu, m) {
 
   m.attr("__device_name__") = "cpu";
   m.attr("__tile_size__") = TILE;
-  m.attr("__dtypes__") = py::make_tuple("float32", "float16");
+  m.attr("__dtypes__") = py::make_tuple("float32", "float16", "bfloat16");
 
   py::class_<AlignedArray>(m, "Array")
       .def(py::init<size_t, std::string>(), py::arg("size"), py::arg("dtype") = "float32",
@@ -596,14 +635,17 @@ PYBIND11_MODULE(ndarray_backend_cpu, m) {
     std::transform(numpy_strides.begin(), numpy_strides.end(), numpy_strides.begin(),
                    [elem](size_t& c) { return c * elem; });
     const char* base = static_cast<const char*>(a.ptr) + offset * elem;
-    return py::array(py::dtype(a.dtype_name()), shape, numpy_strides, base);
+    // bfloat16 comes back as uint16 bit patterns (see TransferDTypeName)
+    return py::array(py::dtype(a.transfer_dtype_name()), shape, numpy_strides, base);
   });
 
   // convert from numpy (with copying); the array must be C-contiguous with out's dtype
+  // (for bfloat16: its uint16 bit patterns, or an ml_dtypes.bfloat16 array)
   m.def("from_numpy", [](py::array a, AlignedArray* out) {
-    if (std::string(py::str(a.dtype())) != out->dtype_name()) {
+    const std::string got = py::str(a.dtype());
+    if (got != out->dtype_name() && got != out->transfer_dtype_name()) {
       throw std::invalid_argument("from_numpy: expected " + out->dtype_name() + " array, got " +
-                                  std::string(py::str(a.dtype())));
+                                  got);
     }
     if (!(a.flags() & py::array::c_style)) {
       throw std::invalid_argument("from_numpy: array must be C-contiguous");
