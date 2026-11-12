@@ -1,6 +1,7 @@
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
+#include <mma.h>
 #include <pybind11/numpy.h>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
@@ -443,6 +444,187 @@ __global__ void MatmulBatchedKernel(const T* a, const T* b, T* out, uint32_t bat
   }
 }
 
+////////////////////////////////////////////////////////////////////////////////
+// Tensor core (MMA) matmul for float16 / bfloat16
+////////////////////////////////////////////////////////////////////////////////
+
+/**
+ * Half precision matmuls run on the tensor cores through the WMMA API: every warp multiplies
+ * 16x16x16 tiles with float32 accumulation, so the contract of the scalar kernel still holds
+ * (half precision inputs, float32 accumulation, one rounding of the result). Only the order in
+ * which the float32 partial sums are added differs, so results can differ from the scalar
+ * kernel in the last bit of the float16 / bfloat16 output.
+ *
+ *   float16:  compute capability 7.0+ (Volta)
+ *   bfloat16: compute capability 8.0+ (Ampere)
+ *
+ * Block tile 64 x 64 (output) x 16 (inner dimension), 4 warps in a 2 x 2 arrangement, each
+ * computing a 32 x 32 sub-tile as 2 x 2 accumulator fragments. Tiles are staged through shared
+ * memory with zero padding, so any M, N, P, batch strides and alignment work. Every other case
+ * (float32, older GPUs, binaries built without code for this GPU, or MMA disabled through
+ * set_mma_enabled(False) / NEEDLE_CUDA_MMA=0) uses MatmulBatchedKernel.
+ */
+#define MMA_BM 64
+#define MMA_BN 64
+#define MMA_BK 16
+#define MMA_THREADS 128
+// padded leading dimensions: multiples of 8 (16-bit) / 4 (float) elements as WMMA requires, and
+// every fragment start stays 32-byte aligned
+#define MMA_A_LD (MMA_BK + 8)
+#define MMA_B_LD (MMA_BN + 8)
+#define MMA_C_LD (MMA_BN + 4)
+
+// mma.h only declares nvcuda::wmma when compiling for sm_70+ (and in the host pass)
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 700
+template <typename T>
+__device__ void MatmulMmaBody(const T* a, const T* b, T* out, uint32_t batch, uint32_t M,
+                              uint32_t N, uint32_t P, size_t a_batch_stride,
+                              size_t b_batch_stride) {
+  namespace wmma = nvcuda::wmma;
+  __shared__ __align__(32) T As[MMA_BM * MMA_A_LD];
+  __shared__ __align__(32) T Bs[MMA_BK * MMA_B_LD];
+  __shared__ __align__(32) float Cs[MMA_BM * MMA_C_LD];
+
+  const int tid = threadIdx.x;
+  const int warp = tid / 32;
+  const int warp_row = warp / 2, warp_col = warp % 2;  // this warp's 32 x 32 sub-tile
+  const size_t row0 = (size_t)blockIdx.x * MMA_BM;
+  const size_t col0 = (size_t)blockIdx.y * MMA_BN;
+  T zero;
+  Store(&zero, 0, 0.0f);
+
+  for (size_t z = blockIdx.z; z < batch; z += gridDim.z) {
+    const T* az = a + z * a_batch_stride;
+    const T* bz = b + z * b_batch_stride;
+    T* oz = out + z * (size_t)M * P;
+
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[2][2];
+    for (int i = 0; i < 2; i++)
+      for (int j = 0; j < 2; j++) wmma::fill_fragment(acc[i][j], 0.0f);
+
+    for (size_t k0 = 0; k0 < N; k0 += MMA_BK) {
+      // stage the A (64 x 16) and B (16 x 64) tiles, zero padded at the matrix edges
+      for (int e = tid; e < MMA_BM * MMA_BK; e += MMA_THREADS) {
+        const int r = e / MMA_BK, c = e % MMA_BK;
+        const size_t gr = row0 + r, gc = k0 + c;
+        As[r * MMA_A_LD + c] = (gr < M && gc < N) ? az[gr * N + gc] : zero;
+      }
+      for (int e = tid; e < MMA_BK * MMA_BN; e += MMA_THREADS) {
+        const int r = e / MMA_BN, c = e % MMA_BN;
+        const size_t gr = k0 + r, gc = col0 + c;
+        Bs[r * MMA_B_LD + c] = (gr < N && gc < P) ? bz[gr * P + gc] : zero;
+      }
+      __syncthreads();
+
+      wmma::fragment<wmma::matrix_a, 16, 16, 16, T, wmma::row_major> a_frag[2];
+      wmma::fragment<wmma::matrix_b, 16, 16, 16, T, wmma::row_major> b_frag[2];
+      for (int i = 0; i < 2; i++)
+        wmma::load_matrix_sync(a_frag[i], As + (warp_row * 32 + i * 16) * MMA_A_LD, MMA_A_LD);
+      for (int j = 0; j < 2; j++)
+        wmma::load_matrix_sync(b_frag[j], Bs + warp_col * 32 + j * 16, MMA_B_LD);
+      for (int i = 0; i < 2; i++)
+        for (int j = 0; j < 2; j++) wmma::mma_sync(acc[i][j], a_frag[i], b_frag[j], acc[i][j]);
+      __syncthreads();
+    }
+
+    // float32 accumulators -> shared memory -> one rounding per output element
+    for (int i = 0; i < 2; i++)
+      for (int j = 0; j < 2; j++)
+        wmma::store_matrix_sync(Cs + (warp_row * 32 + i * 16) * MMA_C_LD + warp_col * 32 + j * 16,
+                                acc[i][j], MMA_C_LD, wmma::mem_row_major);
+    __syncthreads();
+    for (int e = tid; e < MMA_BM * MMA_BN; e += MMA_THREADS) {
+      const int r = e / MMA_BN, c = e % MMA_BN;
+      const size_t gr = row0 + r, gc = col0 + c;
+      if (gr < M && gc < P) Store(oz, gr * P + gc, Cs[r * MMA_C_LD + c]);
+    }
+    __syncthreads();
+  }
+}
+
+#endif  // MatmulMmaBody
+
+// One kernel per type, each compiled only where the tensor cores support it; for older
+// architectures the body is empty and MmaAvailable() keeps the host from launching it.
+__global__ void MatmulMmaHalfKernel(const __half* a, const __half* b, __half* out, uint32_t batch,
+                                    uint32_t M, uint32_t N, uint32_t P, size_t a_batch_stride,
+                                    size_t b_batch_stride) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
+  MatmulMmaBody<__half>(a, b, out, batch, M, N, P, a_batch_stride, b_batch_stride);
+#endif
+}
+
+__global__ void MatmulMmaBF16Kernel(const __nv_bfloat16* a, const __nv_bfloat16* b,
+                                    __nv_bfloat16* out, uint32_t batch, uint32_t M, uint32_t N,
+                                    uint32_t P, size_t a_batch_stride, size_t b_batch_stride) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+  MatmulMmaBody<__nv_bfloat16>(a, b, out, batch, M, N, P, a_batch_stride, b_batch_stride);
+#endif
+}
+
+/// MMA on by default; NEEDLE_CUDA_MMA=0 in the environment turns it off at import.
+static bool g_mma_enabled = [] {
+  const char* env = std::getenv("NEEDLE_CUDA_MMA");
+  return !(env != nullptr && std::string(env) == "0");
+}();
+
+static int DeviceComputeCapability() {
+  int dev = 0, major = 0, minor = 0;
+  if (cudaGetDevice(&dev) != cudaSuccess ||
+      cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) != cudaSuccess ||
+      cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev) != cudaSuccess) {
+    cudaGetLastError();  // clear the error state
+    return 0;
+  }
+  return major * 10 + minor;
+}
+
+/// Architecture the kernel's code for this GPU was compiled for (its PTX version): a binary
+/// built only for older GPUs would run the (empty) pre-Volta body through PTX JIT.
+static int KernelArch(const void* kernel) {
+  cudaFuncAttributes attr;
+  if (cudaFuncGetAttributes(&attr, kernel) != cudaSuccess) {
+    cudaGetLastError();
+    return 0;
+  }
+  return attr.ptxVersion;
+}
+
+/// Whether the tensor core kernel can run for `dt` on this GPU with this binary.
+static bool MmaAvailable(DType dt) {
+  static int half_ok = -1, bf16_ok = -1;
+  if (dt == DType::F16) {
+    if (half_ok < 0)
+      half_ok = DeviceComputeCapability() >= 70 && KernelArch((const void*)MatmulMmaHalfKernel) >= 70;
+    return half_ok == 1;
+  }
+  if (dt == DType::BF16) {
+    if (bf16_ok < 0)
+      bf16_ok = DeviceComputeCapability() >= 80 && KernelArch((const void*)MatmulMmaBF16Kernel) >= 80;
+    return bf16_ok == 1;
+  }
+  return false;  // float32 keeps the scalar kernel (TF32 would change float32 results)
+}
+
+/// Launch the tensor core kernel if it applies; returns false to use the scalar kernel.
+static bool MatmulMma(const CudaArray& a, const CudaArray& b, CudaArray* out, uint32_t batch,
+                      uint32_t M, uint32_t N, uint32_t P, size_t a_batch_stride,
+                      size_t b_batch_stride) {
+  if (!g_mma_enabled || !MmaAvailable(a.dtype)) return false;
+  dim3 block(MMA_THREADS);
+  dim3 grid((M + MMA_BM - 1) / MMA_BM, (P + MMA_BN - 1) / MMA_BN,
+            std::min<uint32_t>(batch, 65535));
+  if (a.dtype == DType::F16) {
+    MatmulMmaHalfKernel<<<grid, block>>>(a.as<__half>(), b.as<__half>(), out->as<__half>(), batch,
+                                         M, N, P, a_batch_stride, b_batch_stride);
+  } else {
+    MatmulMmaBF16Kernel<<<grid, block>>>(a.as<__nv_bfloat16>(), b.as<__nv_bfloat16>(),
+                                         out->as<__nv_bfloat16>(), batch, M, N, P,
+                                         a_batch_stride, b_batch_stride);
+  }
+  return true;
+}
+
 void MatmulBatched(const CudaArray& a, const CudaArray& b, CudaArray* out, uint32_t batch,
                    uint32_t M, uint32_t N, uint32_t P, size_t a_batch_stride,
                    size_t b_batch_stride) {
@@ -451,10 +633,14 @@ void MatmulBatched(const CudaArray& a, const CudaArray& b, CudaArray* out, uint3
    *
    * a / b: compact arrays; matrix z starts at z * a_batch_stride / z * b_batch_stride elements
    * (stride 0: one matrix shared by the whole batch). out: compact batch x M x P.
+   *
+   * float16 / bfloat16 use the tensor cores when available (MatmulMma); the 2D Matmul goes
+   * through here too, so 2D and batched products always run the same kernel.
    */
   CheckSameDType(a, b);
   CheckSameDType(a, *out);
   if (batch == 0 || M == 0 || P == 0) return;
+  if (MatmulMma(a, b, out, batch, M, N, P, a_batch_stride, b_batch_stride)) return;
   dim3 block(TILE, TILE);
   dim3 grid((M + TILE - 1) / TILE, (P + TILE - 1) / TILE, std::min<uint32_t>(batch, 65535));
   NEEDLE_DISPATCH(a.dtype, T, {
@@ -663,6 +849,13 @@ PYBIND11_MODULE(ndarray_backend_cuda, m) {
 
   m.def("matmul", Matmul);
   m.def("matmul_batched", MatmulBatched);
+
+  // tensor core matmul for float16 / bfloat16
+  m.def("mma_available", [](const std::string& dtype) { return MmaAvailable(ParseDType(dtype)); },
+        "whether matmuls of this dtype run on the tensor cores on this GPU");
+  m.def("mma_enabled", [] { return g_mma_enabled; });
+  m.def("set_mma_enabled", [](bool enabled) { g_mma_enabled = enabled; },
+        "use the tensor cores for float16 / bfloat16 matmuls (default: on, or NEEDLE_CUDA_MMA=0)");
 
   m.def("reduce_max", ReduceMax);
   m.def("reduce_sum", ReduceSum);
