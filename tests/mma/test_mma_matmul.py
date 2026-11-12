@@ -43,15 +43,44 @@ def mma_switch():
     CUDA.set_mma_enabled(before)
 
 
-def ulp_diff(a, b):
-    a, b = np.ascontiguousarray(a), np.ascontiguousarray(b)
-    a32, b32 = a.astype(f32), b.astype(f32)
-    np.testing.assert_array_equal(np.isnan(a32), np.isnan(b32))
-    ia = a.view(np.int16).astype(np.int32)
-    ib = b.view(np.int16).astype(np.int32)
-    ia = np.where(ia < 0, -32768 - ia, ia)
-    ib = np.where(ib < 0, -32768 - ib, ib)
-    return int(np.max(np.abs(ia - ib), initial=0))
+# precision (significant bits) and minimum normal exponent of the half types
+_FORMAT = {"float16": (11, -14), "bfloat16": (8, -126)}
+
+
+def ulp(x, dtype):
+    """Unit in the last place of the half precision type at |x| (subnormals included)."""
+    p, emin = _FORMAT[dtype]
+    x = np.abs(np.asarray(x, np.float64))
+    e = np.maximum(np.floor(np.log2(np.where(x > 0, x, 1.0))), emin)
+    return np.exp2(e - (p - 1))
+
+
+def accumulation_bound(a, b, k, kernel):
+    """Worst-case float32 accumulation error of a @ b, as a multiple of sum |a_ik b_kj|.
+
+    tensor cores: products are exact, each 16-wide step aligns the partial sum to its
+      largest term and truncates (it does not round to nearest), ~2^-23 relative per
+      step; 2^-21 per step keeps a 4x safety margin.
+    scalar kernel: one rounded fused multiply-add per term, <= k * 2^-24 relative.
+    Bug-sized errors (wrong elements, missing tiles) are O(sum |a b|), orders above this.
+    """
+    magnitude = np.abs(a.astype(np.float64)) @ np.abs(b.astype(np.float64))
+    steps = -(-k // 16)
+    rel = {"mma": steps * 2.0 ** -21, "scalar": k * 2.0 ** -24}[kernel]
+    return rel * magnitude
+
+
+def check_within(out, ref, bound, dtype, what):
+    """|out - ref| <= bound everywhere; on failure report the worst element."""
+    err = np.abs(out.astype(np.float64) - ref.astype(np.float64))
+    excess = err / bound
+    worst = np.unravel_index(np.argmax(excess), excess.shape)
+    assert excess.max() <= 1.0, (
+        f"{what}: worst element {worst}: got {out[worst]}, expected {ref[worst]}, "
+        f"|err| = {err[worst]:.3g} = {err[worst] / ulp(ref[worst], dtype):.1f} ulp, "
+        f"bound {bound[worst]:.3g} ({excess.max():.2f}x the bound)"
+    )
+    return float(excess.max())
 
 
 def run(a, b, dtype, mma, switch):
@@ -109,13 +138,37 @@ def test_environment_variable_disables_mma():
 
 @pytest.mark.parametrize("sa,sb", SHAPES)
 @pytest.mark.parametrize("dtype", ["float16", "bfloat16"])
+def test_mma_exact_on_integer_data(sa, sb, dtype, mma_switch):
+    """Small integers: every product and partial sum is an exactly representable
+    integer, so ANY accumulation order or truncation gives the exact result.
+    A mismatch here is an indexing / tiling bug, not rounding."""
+    require_mma(dtype)
+    rng = np.random.default_rng(0)
+    k = sa[-1]
+    hi = 3 if dtype == "float16" else 1  # |sum| <= hi^2 * k fits the type's integers
+    assert hi * hi * k <= (2048 if dtype == "float16" else 256)
+    a = rng.integers(-hi, hi + 1, sa).astype(f32).astype(np_type(dtype))
+    b = rng.integers(-hi, hi + 1, sb).astype(f32).astype(np_type(dtype))
+    out = run(a, b, dtype, True, mma_switch)
+    ref = exact(a, b, dtype)
+    mismatch = np.argwhere(out.astype(f32) != ref.astype(f32))
+    assert mismatch.size == 0, f"{len(mismatch)} wrong elements, first at {tuple(mismatch[0])}"
+
+
+@pytest.mark.parametrize("sa,sb", SHAPES)
+@pytest.mark.parametrize("dtype", ["float16", "bfloat16"])
 def test_mma_matches_exact_product(sa, sb, dtype, mma_switch):
+    """Random data: error within one rounding of the output plus the tensor cores'
+    float32 accumulation error (they truncate while accumulating, so near-zero
+    results of large cancelling sums can be many ulps off -- see accumulation_bound)."""
     require_mma(dtype)
     np.random.seed(0)
     a = np.random.uniform(-1, 1, sa).astype(f32).astype(np_type(dtype))
     b = np.random.uniform(-1, 1, sb).astype(f32).astype(np_type(dtype))
     out = run(a, b, dtype, True, mma_switch)
-    assert ulp_diff(out, exact(a, b, dtype)) <= 1  # float32 accumulation + one rounding
+    ref = exact(a, b, dtype)
+    bound = ulp(ref.astype(f32), dtype) + accumulation_bound(a, b, sa[-1], "mma")
+    check_within(out, ref, bound, dtype, "tensor cores vs exact")
 
 
 @pytest.mark.parametrize("sa,sb", SHAPES)
@@ -125,7 +178,11 @@ def test_mma_agrees_with_scalar_kernel(sa, sb, dtype, mma_switch):
     np.random.seed(1)
     a = np.random.uniform(-1, 1, sa).astype(f32).astype(np_type(dtype))
     b = np.random.uniform(-1, 1, sb).astype(f32).astype(np_type(dtype))
-    assert ulp_diff(run(a, b, dtype, True, mma_switch), run(a, b, dtype, False, mma_switch)) <= 1
+    on, off = run(a, b, dtype, True, mma_switch), run(a, b, dtype, False, mma_switch)
+    k = sa[-1]
+    bound = (2 * ulp(off.astype(f32), dtype)
+             + accumulation_bound(a, b, k, "mma") + accumulation_bound(a, b, k, "scalar"))
+    check_within(on, off, bound, dtype, "tensor cores vs scalar kernel")
 
 
 @pytest.mark.parametrize("dtype", ["float16", "bfloat16"])
@@ -155,13 +212,17 @@ def test_large_batch_and_views(dtype, mma_switch):
     a = np.random.randn(70000, 2, 3).astype(f32).astype(t)
     b = np.random.randn(3, 2).astype(f32).astype(t)
     out = (nd.array(a, device=CUDA) @ nd.array(b, device=CUDA)).numpy()
-    assert ulp_diff(out, exact(a, b, dtype)) <= 1
+    ref = exact(a, b, dtype)
+    check_within(out, ref, ulp(ref.astype(f32), dtype) + accumulation_bound(a, b, 3, "mma"),
+                 dtype, "large batch")
     x = np.random.randn(2, 40, 30).astype(f32).astype(t)
     X = nd.array(x, device=CUDA)
     V = X.permute((0, 2, 1))[:, 5:25, :]  # (2, 20, 40), non-compact
     W = X[:, :, 3:23]  # (2, 40, 20), non-compact
-    ref = np.swapaxes(x, 1, 2)[:, 5:25, :].astype(np.float64) @ x[:, :, 3:23].astype(np.float64)
-    assert ulp_diff((V @ W).numpy(), ref.astype(f32).astype(t)) <= 1
+    va, wb = np.swapaxes(x, 1, 2)[:, 5:25, :], x[:, :, 3:23]
+    ref = (va.astype(np.float64) @ wb.astype(np.float64)).astype(f32).astype(t)
+    check_within((V @ W).numpy(), ref, ulp(ref.astype(f32), dtype) + accumulation_bound(va, wb, 40, "mma"),
+                 dtype, "views")
 
 
 def test_float32_does_not_use_tensor_cores(mma_switch):
