@@ -139,14 +139,16 @@ def test_environment_variable_disables_mma():
 @pytest.mark.parametrize("sa,sb", SHAPES)
 @pytest.mark.parametrize("dtype", ["float16", "bfloat16"])
 def test_mma_exact_on_integer_data(sa, sb, dtype, mma_switch):
-    """Small integers: every product and partial sum is an exactly representable
-    integer, so ANY accumulation order or truncation gives the exact result.
-    A mismatch here is an indexing / tiling bug, not rounding."""
+    """Small integers: every product and every float32 partial sum is an exactly
+    representable integer, so ANY accumulation order or truncation produces the
+    exact integer sum, which the kernel and the reference then round once, the same
+    way, to the half precision output. A mismatch here is an indexing / tiling bug,
+    not rounding."""
     require_mma(dtype)
     rng = np.random.default_rng(0)
     k = sa[-1]
-    hi = 3 if dtype == "float16" else 1  # |sum| <= hi^2 * k fits the type's integers
-    assert hi * hi * k <= (2048 if dtype == "float16" else 256)
+    hi = 3
+    assert hi * hi * k < 2 ** 24  # every partial sum is an exact float32 integer
     a = rng.integers(-hi, hi + 1, sa).astype(f32).astype(np_type(dtype))
     b = rng.integers(-hi, hi + 1, sb).astype(f32).astype(np_type(dtype))
     out = run(a, b, dtype, True, mma_switch)
