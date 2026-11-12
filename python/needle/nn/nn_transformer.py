@@ -45,6 +45,11 @@ class MultiHeadAttention(Module):
         -inf there, and a row of -inf gives NaN after the max subtraction), and the
         factor 1/2 leaves headroom so adding it to a negative logit cannot
         overflow to -inf either."""
+        dtype = ndarray.normalize_dtype(dtype)
+        if dtype == "bfloat16":
+            import ml_dtypes  # numpy's finfo does not know bfloat16
+
+            return -float(ml_dtypes.finfo(ml_dtypes.bfloat16).max) / 2
         return -np.finfo(dtype).max / 2
 
     def create_causal_mask(self, i, j, device, dtype="float32"):
@@ -53,8 +58,10 @@ class MultiHeadAttention(Module):
         Input: i, j: the shape of the mask to be created
                dtype: dtype of the attention logits the mask is added to
         """
-        mask = self.causal_mask_value(dtype) * np.triu(
-            np.ones((1, 1, i, j), dtype=dtype), j - i + 1)
+        dtype = ndarray.normalize_dtype(dtype)
+        np_dtype = ndarray.numpy_dtype(dtype)
+        mask = (np.triu(np.ones((1, 1, i, j), dtype=np.float32), j - i + 1)
+                * np.float32(self.causal_mask_value(dtype))).astype(np_dtype)
 
         return ndarray.array(
             mask, device=device, dtype=dtype)
