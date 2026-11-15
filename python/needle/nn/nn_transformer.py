@@ -1,5 +1,5 @@
 from typing import List
-from needle.autograd import Tensor
+from needle.autograd import Tensor, checkpoint
 import needle.backend_ndarray.ndarray as ndarray
 from needle import ops
 import needle.init as init
@@ -331,7 +331,8 @@ class Transformer(Module):
         device = None,
         dtype = "float32",
         batch_first = False,
-        sequence_len = 2048
+        sequence_len = 2048,
+        checkpoint = False,
     ):
 
         super().__init__()
@@ -339,6 +340,7 @@ class Transformer(Module):
         self.device = device
         self.dtype = dtype
         self.batch_first = batch_first
+        self.checkpoint = checkpoint  # one checkpointed segment per layer
 
         ### BEGIN YOUR SOLUTION
         # raise NotImplementedError()
@@ -384,7 +386,11 @@ class Transformer(Module):
         )
         pos = self.pos_embed(position_ids) 
         x = x + pos 
-        x = self.layers(x)
+        if self.checkpoint:
+            for layer in self.layers.modules:
+                x = checkpoint(layer, x)
+        else:
+            x = self.layers(x)
         ### END YOUR SOLUTION
 
         if not self.batch_first:

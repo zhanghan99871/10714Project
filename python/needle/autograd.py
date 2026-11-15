@@ -216,6 +216,21 @@ class enable_grad(set_grad_enabled):
         super().__init__(True)
 
 
+##############################
+### Gradient checkpointing ###
+##############################
+
+
+class _CheckpointState:
+    """The record of the segment that checkpoint() is running (None outside one)."""
+
+    def __init__(self):
+        self.record = None
+
+
+_CHECKPOINT = _CheckpointState()
+
+
 class _AutocastDisabled:
     """Internal: suspend autocast (backward always runs in the forward dtypes)."""
 
@@ -338,11 +353,6 @@ class Value:
                 "Cannot release leaf tensor data."
             )
 
-        if self._shape is None:
-            raise RuntimeError(
-                "Cannot release an uninitialized tensor."
-            )
-
         self.cached_data = None
 
     def is_leaf(self):
@@ -384,6 +394,11 @@ class Value:
         self._shape = None
         self._dtype = None
         self._device = None
+        # checkpoint() records the nodes inside the segment
+        # a node is recorded if it 1. is not a leaf 2. requires gradient 3. inside a segment 
+        self._checkpoint_interior = False
+        if op is not None and requires_grad and _CHECKPOINT.record is not None:
+            _CHECKPOINT.record.append(self)
 
         if cached_data is not None and isinstance(self, Tensor):
             self._update_metadata(cached_data)
@@ -669,6 +684,50 @@ class Tensor(Value):
     def float(self, release_input: bool = True):
         return self.astype("float32", release_input=release_input)
 
+def checkpoint(fn, *args):
+    """Run fn(*args) as a checkpointed segment and return its result.
+
+    When fn returns, checkpoint() releases the activations made inside the segment;
+    it does not release the segment's inputs or its outputs (every Tensor /
+    TensorTuple in the result, searched through nested tuples and lists). Backward
+    recomputes a released activation from the recorded graph when a gradient needs
+    it, and releases it (and its adjoint) again once it has processed it. The
+    recompute replays the recorded ops, not fn: Python code in fn runs once (e.g.
+    BatchNorm's running statistics are updated once), and a Dropout mask (a leaf)
+    is reused.
+
+    Under no_grad, or when nothing in fn requires grad, nothing is recorded and the
+    call is just fn(*args).
+
+    Not supported:
+    * dicts in the result: tensors inside them are not found and are released like
+      activations (TransformerLayer, RNN and LSTM do not return dicts);
+    * nested checkpoints (checkpoint() called inside fn);
+    * LAZY_MODE.
+
+    Reading a released activation recomputes it from the current parameters: after
+    an optimizer step its value differs from the value of the forward pass.
+    """
+    _CHECKPOINT.record = []
+    try:
+        out = fn(*args)
+    finally:
+        record, _CHECKPOINT.record = _CHECKPOINT.record, None
+    outputs = {id(v) for v in _segment_outputs(out)}
+    for node in record:
+        if id(node) not in outputs:
+            node.release_cached_data()
+            node._checkpoint_interior = True
+    return out
+
+
+def _segment_outputs(out) -> List[Value]:
+    """The Values in a result of fn, searched through nested tuples and lists."""
+    if isinstance(out, (tuple, list)):
+        return [v for o in out for v in _segment_outputs(o)]
+    return [out] if isinstance(out, Value) else []
+
+
 def compute_gradient_of_variables(output_tensor, out_grad, create_graph=False):
     """Take gradient of output node with respect to each node in node_list.
 
@@ -741,6 +800,12 @@ def _compute_gradient_of_variables(output_tensor, out_grad):
                 node_to_output_grads_list[prior].append(prior_grad)
             else:
                 node_to_output_grads_list[prior] = [prior_grad]
+        if each._checkpoint_interior:
+            # recomputed for this backward pass only (see checkpoint()); its adjoint
+            # is not needed once the node is processed either
+            each.release_cached_data()
+            each.grad = None
+            del node_to_output_grads_list[each]
     
     
     ### END YOUR SOLUTION
