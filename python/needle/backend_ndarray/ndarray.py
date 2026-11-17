@@ -1,5 +1,6 @@
 import math
 import operator
+import weakref
 from functools import reduce
 from typing import Any, Callable, Iterable, Union
 
@@ -136,6 +137,45 @@ def all_devices() -> list[BackendDevice]:
     return [cpu(), cuda(), cpu_numpy()]
 
 
+# Bytes held by NDArray buffers, per device name: [allocated, peak]. Every buffer
+# is allocated in NDArray.make; a finalizer on its handle subtracts it when freed.
+# Not counted: the CUDA context, host copies made by numpy(), numpy temporaries.
+_MEMORY_STATS: dict[str, list[int]] = {}
+
+
+def _memory_stats(device: BackendDevice | None) -> list[int]:
+    device = device if device is not None else default_device()
+    return _MEMORY_STATS.setdefault(device.name, [0, 0])
+
+
+def _track_allocation(array: "NDArray") -> None:
+    stats = _memory_stats(array.device)
+    nbytes = array.size * array.itemsize
+    stats[0] += nbytes
+    stats[1] = max(stats[1], stats[0])
+    weakref.finalize(array._handle, _track_free, stats, nbytes)
+
+
+def _track_free(stats: list[int], nbytes: int) -> None:
+    stats[0] -= nbytes
+
+
+def memory_allocated(device: BackendDevice | None = None) -> int:
+    """Bytes currently held by NDArray buffers on `device` (default: default_device())."""
+    return _memory_stats(device)[0]
+
+
+def max_memory_allocated(device: BackendDevice | None = None) -> int:
+    """Peak of memory_allocated(device) since start-up or the last reset_peak_memory_stats(device)."""
+    return _memory_stats(device)[1]
+
+
+def reset_peak_memory_stats(device: BackendDevice | None = None) -> None:
+    """Set the peak of `device` to the bytes it holds now."""
+    stats = _memory_stats(device)
+    stats[1] = stats[0]
+
+
 class NDArray:
     """A generic ND array class that may contain multipe different backends
     i.e., a Numpy backend, a native CPU backend, or a GPU backend.
@@ -235,6 +275,7 @@ class NDArray:
                     f"(supported: {array.device.dtypes})"
                 )
             array._dtype = dtype
+            _track_allocation(array)
         else:
             array._handle = handle
             array._dtype = getattr(handle, "dtype", "float32")
