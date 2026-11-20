@@ -63,7 +63,7 @@ class ResNet9(ndl.nn.Module):
 class LanguageModel(nn.Module):
     def __init__(self, embedding_size, output_size, hidden_size, num_layers=1,
                  seq_model='rnn', seq_len=40, device=None, dtype="float32", checkpoint=False,
-                 policies=None):
+                 policies=None, half_softmax=False):
         """
         Consists of an embedding layer, a sequence model (either RNN or LSTM), and a
         linear layer.
@@ -75,7 +75,9 @@ class LanguageModel(nn.Module):
         num_layers: Number of layers in RNN or LSTM
         checkpoint: transformer only: one checkpointed segment per layer
         policies: transformer only: per-layer segment policies ("fp32" / "fp16" /
-            "none"), see nn.Transformer and set_policies()
+            "none" / "fp16_none"), see nn.Transformer and set_policies()
+        half_softmax: transformer only: attention softmax of half-precision
+            segments in float16 (see nn.Transformer)
         """
         super(LanguageModel, self).__init__()
         ### BEGIN YOUR SOLUTION
@@ -87,7 +89,7 @@ class LanguageModel(nn.Module):
             self.sequence_model = nn.LSTM(embedding_size, hidden_size, num_layers=num_layers, device=device, dtype=dtype)
         elif seq_model == 'transformer':
             self.sequence_model = nn.Transformer(embedding_size, hidden_size, num_layers=num_layers, device=device, dtype=dtype, checkpoint=checkpoint,
-                                                 policies=policies)
+                                                 policies=policies, half_softmax=half_softmax)
         if seq_model == 'transformer':
             self.final_proj = nn.Linear(embedding_size, output_size, device=device, dtype=dtype)
         else:

@@ -65,23 +65,28 @@ def test_segment_hook_events(device):
 
 def test_profile_structure(cpu_profile):
     _, _, prof = cpu_profile
-    assert prof.num_segments == LAYERS and prof.policies == ["fp32", "fp16", "none"]
+    assert prof.num_segments == LAYERS and prof.policies == ["fp32", "fp16", "none", "fp16_none"]
     assert prof.device == "cpu" and prof.key == "12x4" and prof.mma is None
+    assert prof.half_softmax is False
     assert prof.base_time > 0 and prof.static > 0 and prof.base_peak > 0
     for i in range(LAYERS):
         assert prof.time_delta[i]["fp32"] == 0.0 and prof.peak_delta[i]["fp32"] == 0
-        assert set(prof.time_delta[i]) == set(prof.peak_delta[i]) == {"fp32", "fp16", "none"}
+        assert set(prof.time_delta[i]) == set(prof.peak_delta[i]) == {"fp32", "fp16", "none", "fp16_none"}
+        assert set(prof.recompute[i]) == {"none", "fp16_none"}
         assert all(v >= 0 for v in prof.time_spread[i].values())
-    assert set(prof.measured_peak) == {"fp32,fp32,fp32", "fp16,fp16,fp16", "none,none,none"}
+    assert set(prof.measured_peak) == {"fp32,fp32,fp32", "fp16,fp16,fp16", "none,none,none",
+                                       "fp16_none,fp16_none,fp16_none"}
     assert prof.correction >= 0
 
 
 def test_memory_costs_are_ordered(cpu_profile):
     _, _, prof = cpu_profile
     for i in range(LAYERS):
-        assert prof.peak_delta[i]["none"] < prof.peak_delta[i]["fp16"] < prof.peak_delta[i]["fp32"] == 0
-        assert prof.held[i]["none"] < prof.held[i]["fp16"] < prof.held[i]["fp32"]
-        assert prof.recompute[i] > prof.held[i]["none"]  # recompute re-materialises the interior
+        pd, held, rec = prof.peak_delta[i], prof.held[i], prof.recompute[i]
+        assert pd["fp16_none"] <= pd["none"] < pd["fp16"] < pd["fp32"] == 0
+        assert held["fp16_none"] <= held["none"] < held["fp16"] < held["fp32"]
+        # recompute re-materialises the interior, in float16 for "fp16_none"
+        assert held["none"] < rec["fp16_none"] < rec["none"]
         assert prof.forward_peak[i]["fp32"] >= prof.held[i]["fp32"]
 
 
@@ -131,7 +136,7 @@ def test_peak_model_matches_measured_steps(device):
     prof = profile_segments(m.sequence_model, loss_fn, params=m.parameters(), warmup=0, repeats=1)
     rng = np.random.RandomState(0)
     for _ in range(5):
-        pol = list(rng.choice(["fp32", "fp16", "none"], LAYERS))
+        pol = list(rng.choice(["fp32", "fp16", "none", "fp16_none"], LAYERS))
         measured = measure_step(m.sequence_model, loss_fn, pol, params=m.parameters(),
                                 warmup=0, repeats=1)
         predicted = prof.predict_peak(pol, absolute=False)
@@ -240,10 +245,33 @@ def test_save_load_round_trip(cpu_profile, tmp_path):
     prof.save(str(path))
     loaded = SegmentProfile.load(str(path))
     assert loaded == prof
-    for pol in (["fp32", "fp16", "none"], "none"):
+    for pol in (["fp32", "fp16", "none"], "none", "fp16_none"):
         assert loaded.predict_peak(pol) == prof.predict_peak(pol)
         assert loaded.predict_time(pol) == prof.predict_time(pol)
-    assert "segment 0" in prof.summary()
+    assert "segment 0" in prof.summary() and "recompute fp16_none" in prof.summary()
+    # profiles saved before "fp16_none" stored one recompute number per segment
+    old = prof.to_dict()
+    old["policies"] = ["fp32", "fp16", "none"]
+    old["recompute"] = [r["none"] for r in prof.recompute]
+    del old["half_softmax"]
+    legacy = SegmentProfile.from_dict(old)
+    assert legacy.recompute == [{"none": r["none"]} for r in prof.recompute]
+    assert legacy.half_softmax is None and "recompute none" in legacy.summary()
+
+
+def test_half_softmax_recorded_and_cheaper():
+    m, loss_fn = setup(ndl.cpu(), shape=(48, 4))
+    tr = m.sequence_model
+    profs = {}
+    for flag in (False, True):
+        tr.half_softmax = flag
+        profs[flag] = profile_segments(tr, loss_fn, params=m.parameters(), policies=["fp32", "fp16"],
+                                       warmup=0, repeats=1)
+        assert profs[flag].half_softmax is flag
+    tr.half_softmax = False
+    for i in range(LAYERS):
+        assert profs[True].peak_delta[i]["fp16"] < profs[False].peak_delta[i]["fp16"]
+    assert profs[True].base_peak == profs[False].base_peak  # float32 segments unaffected
 
 
 def test_profile_cache(cpu_profile):

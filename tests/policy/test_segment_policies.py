@@ -1,4 +1,4 @@
-"""Switchable per-layer segment policies ("fp32" / "fp16" / "none") in nn.Transformer."""
+"""Switchable per-layer segment policies ("fp32" / "fp16" / "none" / "fp16_none") in nn.Transformer."""
 import gc
 import sys
 
@@ -58,6 +58,9 @@ def manual_forward(m, x, policies, release_inputs=True):
         if p == "fp16":
             with ndl.autocast(dtype="float16", release_inputs=release_inputs):
                 h = layer(h)
+        elif p == "fp16_none":
+            with ndl.autocast(dtype="float16", release_inputs=release_inputs):
+                h = ndl.checkpoint(layer, h)
         elif p == "none":
             with ndl.autocast(enabled=False):
                 h = ndl.checkpoint(layer, h)
@@ -105,7 +108,7 @@ def record_modes(m):
 def test_policy_validation():
     m = make_lm(ndl.cpu())
     tr = m.sequence_model
-    assert tr.policies is None and SEGMENT_POLICIES == ("fp32", "fp16", "none")
+    assert tr.policies is None and SEGMENT_POLICIES == ("fp32", "fp16", "none", "fp16_none")
     tr.set_policies("fp16")
     assert tr.policies == ["fp16"] * LAYERS
     tr.set_policies(("none", "fp32", "fp16"))
@@ -227,7 +230,8 @@ def test_memory_ordering():
 # --------------------------------------------------------------------------- switching during training
 
 
-SCHEDULE = [["fp32"] * 3, ["fp16", "none", "fp32"], ["none"] * 3, ["fp16"] * 3, ["fp32", "fp32", "fp16"]]
+SCHEDULE = [["fp32"] * 3, ["fp16", "none", "fp32"], ["none"] * 3, ["fp16"] * 3, ["fp32", "fp32", "fp16"],
+            ["fp16_none", "none", "fp16"], ["fp16_none"] * 3]
 
 
 @pytest.mark.parametrize("device", _DEVICES, ids=_IDS)

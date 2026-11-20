@@ -146,3 +146,40 @@ class LogSumExp(TensorOp):
 
 def logsumexp(a: Tensor, axes: Optional[tuple] = None) -> Tensor:
     return LogSumExp(axes=axes)(a)
+
+class Softmax(TensorOp):
+    """Numerically stable softmax over one axis, as a single op.
+
+    Computes in float32 and stores the result in the input's dtype. Under autocast
+    it keeps the dtype of its input (the default "promote" policy): a float16
+    input gives a float16 output, which is safe because the output lies in [0, 1]
+    and the max is subtracted before exp. Backward keeps only the output p and
+    computes p * (g - sum(p * g)), which cannot overflow in float16 either. (The
+    op-by-op softmax exp(x - max) / sum(...) would be unsafe there: the gradient of
+    its division squares the row sum, which is inf in float16 once a row sums to
+    256 or more.)
+    """
+
+    def __init__(self, axis: int = -1) -> None:
+        self.axis = axis
+
+    def compute(self, a: NDArray) -> NDArray:
+        axis = self.axis % len(a.shape)
+        x = a.astype("float32", copy=False)
+        e = (x - x.max(axis=axis, keepdims=True).broadcast_to(x.shape)).exp()
+        out = e / e.sum(axis=axis, keepdims=True).broadcast_to(x.shape)
+        return out.astype(a.dtype, copy=False)
+
+    def gradient(self, out_grad: Tensor, node: Tensor):
+        p = node
+        if out_grad.dtype != p.dtype:
+            out_grad = out_grad.astype(p.dtype, release_input=False)
+        axis = self.axis % len(p.shape)
+        kept = list(p.shape)
+        kept[axis] = 1
+        s = broadcast_to(reshape(summation(out_grad * p, axes=(axis,)), tuple(kept)), p.shape)
+        return p * (out_grad - s)
+
+
+def softmax(a: Tensor, axis: int = -1) -> Tensor:
+    return Softmax(axis=axis)(a)

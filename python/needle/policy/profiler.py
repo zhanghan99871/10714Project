@@ -2,7 +2,7 @@
 
 The profile is the cost table of the checkpoint-policy optimizer: for every segment
 (one TransformerLayer, see nn.Transformer.set_policies) and every policy in
-SEGMENT_POLICIES ("fp32", "fp16", "none") it measures
+SEGMENT_POLICIES ("fp32", "fp16", "none", "fp16_none") it measures
 
 time      the change of the step time (forward + backward) when only that segment
           switches from "fp32" to the policy (difference method: the baseline step
@@ -20,10 +20,11 @@ memory    from the needle memory counter (NDArray buffers), with the same
           static               bytes held before the step (parameters, inputs,
                                optimizer state, ...)
           base_peak            peak above static of the all-"fp32" step
-          held[i][p], forward_peak[i][p], recompute[i]
+          held[i][p], forward_peak[i][p], recompute[i][p]
                                diagnostics: bytes segment i holds when it returns,
-                               its extra peak while running forward, and (for
-                               "none") the memory it re-materialises in backward
+                               its extra peak while running forward, and (for the
+                               recompute policies "none" / "fp16_none") the memory
+                               it re-materialises in backward
 
 The models are linear in the per-segment choices, as the optimizer needs:
 
@@ -41,6 +42,8 @@ peaks the additive model misses, e.g. if a recompute transient ever set the peak
 
 Times depend on the device and its kernels: profile on the GPU used for training,
 with tensor cores on (mma=True, the default), since "fp16" is only faster there.
+The costs also depend on the model's options (e.g. Transformer.half_softmax, which
+the profile records): re-profile when they change.
 """
 import gc
 import json
@@ -51,6 +54,8 @@ from typing import Callable, Dict, Iterable, List, Optional, Sequence
 
 from ..backend_ndarray import ndarray as nd
 from ..nn.nn_transformer import SEGMENT_POLICIES
+
+RECOMPUTE_POLICIES = ("none", "fp16_none")
 
 __all__ = ["SegmentProfile", "profile_segments", "measure_step", "ProfileCache"]
 
@@ -70,13 +75,14 @@ class SegmentProfile:
     forward_time: List[Dict[str, float]]  # [segment][policy] seconds (diagnostic)
     held: List[Dict[str, int]]  # [segment][policy] bytes (diagnostic)
     forward_peak: List[Dict[str, int]]  # [segment][policy] bytes (diagnostic)
-    recompute: List[int]  # [segment] bytes
+    recompute: List[Dict[str, int]]  # [segment][recompute policy] bytes (diagnostic)
     static: int  # bytes
     base_peak: int  # bytes above static, every segment "fp32"
     peak_delta: List[Dict[str, int]]  # [segment][policy] bytes vs "fp32"
     measured_peak: Dict[str, int] = field(default_factory=dict)  # config -> bytes above static
     correction: int = 0  # bytes
     residuals: Dict[str, int] = field(default_factory=dict)  # config -> measured - modelled
+    half_softmax: Optional[bool] = None  # the transformer's half_softmax when profiled
 
     # ------------------------------------------------------------------ models
     def _check(self, policies: Sequence[str]) -> List[str]:
@@ -112,6 +118,10 @@ class SegmentProfile:
 
     @classmethod
     def from_dict(cls, d: dict) -> "SegmentProfile":
+        d = dict(d)
+        if d["recompute"] and not isinstance(d["recompute"][0], dict):
+            # profiles saved before "fp16_none": one number per segment, for "none"
+            d["recompute"] = [{"none": r} if "none" in d["policies"] else {} for r in d["recompute"]]
         return cls(**d)
 
     def save(self, path: str) -> None:
@@ -124,7 +134,8 @@ class SegmentProfile:
             return cls.from_dict(json.load(f))
 
     def summary(self) -> str:
-        lines = [f"segment profile on {self.device} (mma={self.mma}, key={self.key}): "
+        lines = [f"segment profile on {self.device} (mma={self.mma}, half_softmax={self.half_softmax}, "
+                 f"key={self.key}): "
                  f"base step {self.base_time * 1e3:.2f} ms, static {self.static / 2**20:.1f} MiB, "
                  f"base peak {self.base_peak / 2**20:.1f} MiB, correction {self.correction / 2**20:+.2f} MiB"]
         for i in range(self.num_segments):
@@ -133,7 +144,8 @@ class SegmentProfile:
                 cols.append(f"{p}: {self.time_delta[i][p] * 1e3:+.2f} ms, "
                             f"peak {self.peak_delta[i][p] / 2**20:+.2f} MiB")
             lines.append(f"  segment {i}: " + " | ".join(cols)
-                         + f" | recompute {self.recompute[i] / 2**20:.2f} MiB")
+                         + "".join(f" | recompute {p} {b / 2**20:.2f} MiB"
+                                   for p, b in self.recompute[i].items()))
         return "\n".join(lines)
 
 
@@ -354,7 +366,7 @@ def profile_segments(transformer, loss_fn: Callable, params: Optional[Iterable] 
             h, pk, ft = _segment_memory(transformer, loss_fn, p, prof, device)
             for i in range(n):
                 held[i][p], fpeak[i][p], ftime[i][p] = h[i], pk[i], ft[i]
-        recompute = [fpeak[i]["none"] if "none" in policies else 0 for i in range(n)]
+        recompute = [{p: fpeak[i][p] for p in RECOMPUTE_POLICIES if p in policies} for i in range(n)]
 
         # time and peak: one segment switched at a time, paired with baseline steps
         switched = [(i, p) for i in range(n) for p in policies if p != "fp32"]
@@ -381,6 +393,7 @@ def profile_segments(transformer, loss_fn: Callable, params: Optional[Iterable] 
         policies=policies, num_segments=n, device=device.name, key=key, mma=mma_state,
         base_time=base_time, time_delta=delta, time_spread=spread, forward_time=ftime,
         held=held, forward_peak=fpeak, recompute=recompute, static=static,
+        half_softmax=getattr(transformer, "half_softmax", None),
         base_peak=base_peak, peak_delta=pdelta, measured_peak=measured,
     )
     residual = {name: pk - profile._model_peak(name.split(",")) for name, pk in measured.items()}

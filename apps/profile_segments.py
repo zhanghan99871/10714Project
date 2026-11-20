@@ -3,6 +3,7 @@
     python apps/profile_segments.py                                  # cuda, "activations" size, tensor cores on
     python apps/profile_segments.py --size long --check 12 --out prof.json
     python apps/profile_segments.py --no-mma                         # fp16 matmuls without tensor cores
+    python apps/profile_segments.py --half-softmax                   # attention softmax of fp16 segments in fp16
     python apps/profile_segments.py --device cpu --layers 3 --embedding 64 --hidden 256 --batch 8 --seq-len 32
 
 Builds the model of apps/benchmark.py (random tokens, one fixed batch), runs
@@ -22,6 +23,7 @@ import needle as ndl
 import needle.nn as nn
 from apps.benchmark import SIZES, VOCAB
 from apps.models import LanguageModel
+from needle.nn.nn_transformer import SEGMENT_POLICIES
 from needle.policy import measure_step, profile_segments
 
 MB = 2**20
@@ -37,7 +39,8 @@ def build(args):
         sys.exit(f"the {args.device} backend is not available (no GPU?); try --device cpu")
     np.random.seed(args.seed)
     model = LanguageModel(cfg["embedding_size"], VOCAB, cfg["hidden_size"], num_layers=cfg["num_layers"],
-                          seq_model="transformer", seq_len=cfg["seq_len"], device=device, policies="fp32")
+                          seq_model="transformer", seq_len=cfg["seq_len"], device=device, policies="fp32",
+                          half_softmax=args.half_softmax)
     rng = np.random.RandomState(args.seed + 1)
     x = ndl.Tensor(rng.randint(0, VOCAB, (cfg["seq_len"], cfg["batch"])).astype(np.float32),
                    device=device, requires_grad=False)
@@ -56,7 +59,10 @@ def main():
     parser.add_argument("--hidden", dest="hidden_size", type=int)
     parser.add_argument("--batch", type=int)
     parser.add_argument("--seq-len", dest="seq_len", type=int)
-    parser.add_argument("--policies", default="fp32,fp16,none", help="policies to profile (must include fp32)")
+    parser.add_argument("--policies", default=",".join(SEGMENT_POLICIES),
+                        help="policies to profile (must include fp32)")
+    parser.add_argument("--half-softmax", action="store_true",
+                        help="run the attention softmax of fp16 segments in float16")
     parser.add_argument("--warmup", type=int, default=1)
     parser.add_argument("--repeats", type=int, default=5)
     parser.add_argument("--check", type=int, default=8, help="random configurations to validate")
@@ -69,7 +75,8 @@ def main():
     policies = args.policies.split(",")
     mma = not args.no_mma
     key = f"{cfg['seq_len']}x{cfg['batch']}"
-    print(f"config: {cfg}, device {args.device}, policies {policies}, mma={mma}")
+    print(f"config: {cfg}, device {args.device}, policies {policies}, mma={mma}, "
+          f"half_softmax={args.half_softmax}")
 
     tr = model.sequence_model
     prof = profile_segments(tr, loss_fn, params=model.parameters(), policies=policies,
@@ -82,7 +89,8 @@ def main():
     n = prof.num_segments
     rng = np.random.RandomState(args.seed + 2)
     configs = [[p] * n for p in policies] + [list(rng.choice(policies, n)) for _ in range(args.check)]
-    print(f"\n{'policies':<{7 * n}} {'time pred':>10} {'measured':>10} {'err':>7}   "
+    width = max(len(",".join(c)) for c in configs) + 1
+    print(f"\n{'policies':<{width}} {'time pred':>10} {'measured':>10} {'err':>7}   "
           f"{'peak pred':>10} {'measured':>10} {'err':>7}")
     t_err, p_err = [], []
     for config in configs:
@@ -91,7 +99,7 @@ def main():
         tp, pp = prof.predict_time(config), prof.predict_peak(config, absolute=False)
         t_err.append(tp / r["time"] - 1)
         p_err.append(pp / r["peak"] - 1)
-        print(f"{','.join(config):<{7 * n}} {tp * 1e3:8.2f}ms {r['time'] * 1e3:8.2f}ms {t_err[-1]:+7.1%}   "
+        print(f"{','.join(config):<{width}} {tp * 1e3:8.2f}ms {r['time'] * 1e3:8.2f}ms {t_err[-1]:+7.1%}   "
               f"{pp / MB:8.1f}MB {r['peak'] / MB:8.1f}MB {p_err[-1]:+7.1%}")
     abs_t, abs_p = np.abs(t_err), np.abs(p_err)
     print(f"\ntime error: mean {abs_t.mean():.1%}, max {abs_t.max():.1%};  "
