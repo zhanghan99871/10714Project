@@ -15,8 +15,10 @@ Inside an autocast region every op casts its tensor inputs according to its
   from them (softmax, LayerNorm/BatchNorm statistics, SoftmaxLoss) therefore
   compute in float32 without changes to the modules.
 * ``"promote"`` -- every other op: inputs of different dtypes are cast to the
-  widest one (e.g. a float16 matmul result plus a float32 bias gives float32);
-  inputs of a single dtype are left alone.
+  widest one (e.g. a float16 matmul result plus a float32 residual gives float32);
+  inputs of a single dtype are left alone. nn.Linear is the exception for its
+  bias: it casts the bias to the matmul's dtype first (like PyTorch's addmm), so a
+  Linear layer's output stays float16 (see autograd.autocast_to).
 
 Parameters stay float32 ("master weights"); their float16 copies are created by
 differentiable casts, so gradients arrive in float32. Within one region each

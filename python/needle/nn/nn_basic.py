@@ -1,7 +1,7 @@
 """The module.
 """
 from typing import Any
-from needle.autograd import Tensor
+from needle.autograd import Tensor, autocast_to
 from needle import ops
 import needle.init as init
 import numpy as np
@@ -98,8 +98,14 @@ class Linear(Module):
         # raise NotImplementedError()
         res = X @ self.weight
         if self.need_bias: 
+            bias = self.bias
+            if res.dtype in ("float16", "bfloat16"):
+                # under autocast the matmul ran in half precision: add the bias in
+                # that dtype too (cast once per region, before it is broadcast), as
+                # PyTorch's addmm does, instead of promoting the output to float32
+                bias = autocast_to(bias, res.dtype)
             bias_shape = (1,) * (len(res.shape) - 1) + (self.out_features,)
-            bias = self.bias.reshape(bias_shape)
+            bias = bias.reshape(bias_shape)
             bias = bias.broadcast_to(res.shape)
             return res + bias 
         else:
@@ -232,11 +238,14 @@ class Dropout(Module):
     def forward(self, x: Tensor) -> Tensor:
         ### BEGIN YOUR SOLUTION
         # raise NotImplementedError()
-        if self.training:
-            mask = init.randb(*x.shape, p=(1-self.p), device=x.device, dtype=x.dtype, requires_grad=False) 
-            return x * mask / (1 - self.p) 
-        else:
-            return x 
+        if not self.training or self.p == 0:
+            # nothing to drop: no mask, no extra nodes (a p=0 mask would be all
+            # ones, yet kept with the graph until backward ends)
+            return x
+        mask = init.randb(*x.shape, p=(1-self.p), device=x.device, dtype=x.dtype, requires_grad=False)
+        # scale the mask (a constant) instead of the product, so the graph keeps
+        # one tensor of x's size instead of two (x * mask and its quotient)
+        return x * (mask / (1 - self.p))
         ### END YOUR SOLUTION
 
 
