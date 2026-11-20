@@ -66,6 +66,7 @@ def _release_cast_input(a, out) -> None:
     if (
         isinstance(a, Tensor)
         and not a.is_leaf()
+        and not a._keep_cached  # a segment boundary (nn.run_segment)
         and a.cached_data is not None
         and out.cached_data is not None  # not LAZY_MODE: the cast has been computed
     ):

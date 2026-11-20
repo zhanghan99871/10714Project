@@ -1,5 +1,6 @@
-from typing import List
+from typing import List, Optional, Sequence, Union
 from needle.autograd import Tensor, checkpoint
+from needle.amp import autocast
 import needle.backend_ndarray.ndarray as ndarray
 from needle import ops
 import needle.init as init
@@ -316,6 +317,49 @@ class TransformerLayer(Module):
         return x
 
 
+# Execution policies of one segment (one TransformerLayer), see run_segment:
+#   "fp32"  run in float32 and keep the activations
+#   "fp16"  run under autocast(float16) and keep the (mostly float16) activations
+#   "none"  run in float32 under checkpoint(): keep only the segment boundary and
+#           recompute the activations during backward (gradients bit-identical to "fp32")
+SEGMENT_POLICIES = ("fp32", "fp16", "none")
+
+
+def run_segment(fn, x, policy: str, release_inputs: bool = True):
+    """Run fn(x) as one segment under `policy` (see SEGMENT_POLICIES).
+
+    The precision is set by the policy, also inside an enclosing autocast region:
+    "fp32" and "none" disable autocast, "fp16" enables it with float16. Segment
+    boundaries are float32: the input is converted on entry (an enclosing autocast
+    region may have produced it in half precision, e.g. an embedding matmul) and the
+    result is returned as float32, so the policy of one segment does not change the
+    inputs of the next. The parameters of fn are expected to be float32.
+
+    release_inputs: for "fp16", let the casts that autocast inserts release their
+    (non-leaf) inputs, so that the float32 copies of the segment's activations are
+    freed and the segment keeps mostly float16 data.
+
+    The segment input and output are marked so that no cast releases them (a
+    released boundary would be recomputed, together with the whole previous
+    segment, when it is read again during forward, e.g. by a residual connection).
+    """
+    if policy not in SEGMENT_POLICIES:
+        raise ValueError(f"unknown segment policy {policy!r}; expected one of {SEGMENT_POLICIES}")
+    if x.dtype != "float32":
+        # outside the segment (and before checkpoint), so it is not recomputed
+        x = x.astype("float32", release_input=False)
+    x._keep_cached = True
+    if policy == "fp16":
+        with autocast(dtype="float16", release_inputs=release_inputs):
+            out = fn(x)
+    else:
+        with autocast(enabled=False):
+            out = checkpoint(fn, x) if policy == "none" else fn(x)
+    out = out.astype("float32", release_input=False)
+    out._keep_cached = True
+    return out
+
+
 class Transformer(Module):
 
     def __init__(
@@ -333,7 +377,18 @@ class Transformer(Module):
         batch_first = False,
         sequence_len = 2048,
         checkpoint = False,
+        policies = None,
+        fp16_release_inputs = True,
     ):
+        """
+        checkpoint: one checkpointed segment per layer, run under whatever autocast
+            region encloses the model (used when policies is None).
+        policies: per-layer segment policies ("fp32" / "fp16" / "none", see
+            SEGMENT_POLICIES): a list with one entry per layer, or one string for
+            all layers. None (default) keeps the behaviour selected by `checkpoint`.
+            Change them between steps with set_policies().
+        fp16_release_inputs: release_inputs of the autocast region of "fp16" segments.
+        """
 
         super().__init__()
 
@@ -341,6 +396,10 @@ class Transformer(Module):
         self.dtype = dtype
         self.batch_first = batch_first
         self.checkpoint = checkpoint  # one checkpointed segment per layer
+        self.num_layers = num_layers
+        self.fp16_release_inputs = fp16_release_inputs
+        self.policies = None
+        self.set_policies(policies)
 
         ### BEGIN YOUR SOLUTION
         # raise NotImplementedError()
@@ -386,7 +445,10 @@ class Transformer(Module):
         )
         pos = self.pos_embed(position_ids) 
         x = x + pos 
-        if self.checkpoint:
+        if self.policies is not None:
+            for layer, policy in zip(self.layers.modules, self.policies):
+                x = run_segment(layer, x, policy, self.fp16_release_inputs)
+        elif self.checkpoint:
             for layer in self.layers.modules:
                 x = checkpoint(layer, x)
         else:
@@ -397,3 +459,35 @@ class Transformer(Module):
             x = ops.transpose(x, axes=(0, 1))
 
         return x, init.zeros_like(x)
+
+    def set_policies(self, policies: Optional[Union[str, Sequence[str]]]) -> None:
+        """Select the per-layer segment policies used from the next forward on.
+
+        policies: a sequence with one policy per layer, a single policy for every
+        layer, or None for the behaviour selected by the `checkpoint` argument.
+        Switching between training steps is safe: every step builds a new graph.
+        """
+        if policies is None:
+            self.policies = None
+            return
+        if self.dtype != "float32":
+            raise ValueError(
+                "segment policies need a float32 model (float32 parameters are the master "
+                f"weights); this model has dtype {self.dtype!r}"
+            )
+        if isinstance(policies, str):
+            policies = [policies] * self.num_layers
+        policies = list(policies)
+        if len(policies) != self.num_layers:
+            raise ValueError(
+                f"expected {self.num_layers} segment policies (one per layer), got {len(policies)}"
+            )
+        for p in policies:
+            if p not in SEGMENT_POLICIES:
+                raise ValueError(f"unknown segment policy {p!r}; expected one of {SEGMENT_POLICIES}")
+        self.policies = policies
+
+    @property
+    def needs_loss_scaling(self) -> bool:
+        """True when some segment runs in float16 (train with a GradScaler)."""
+        return self.policies is not None and "fp16" in self.policies
