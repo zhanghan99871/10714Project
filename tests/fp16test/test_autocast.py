@@ -154,11 +154,15 @@ def test_promote_and_passthrough_ops(device):
 
 @pytest.mark.parametrize("device", _DEVICES, ids=_IDS)
 def test_linear_output_dtype(device):
-    """float16 matmul + float32 bias -> float32; without bias the result stays float16."""
+    """Under autocast Linear stays in float16 with or without bias (the bias is cast
+    to the matmul's dtype, like PyTorch's addmm); outside autocast it is float32."""
     x = T(np.ones((2, 4), f32), device)
+    lin = nn.Linear(4, 3, device=device)
     with ndl.autocast():
-        assert nn.Linear(4, 3, device=device)(x).dtype == "float32"
+        assert lin(x).dtype == "float16"
         assert nn.Linear(4, 3, bias=False, device=device)(x).dtype == "float16"
+    assert lin(x).dtype == "float32"
+    assert lin.bias.dtype == "float32"  # the master weights stay float32
 
 
 # --------------------------------------------------------------------------- gradients
@@ -184,12 +188,11 @@ def test_autocast_equals_manual_casts(device):
                 loss = nn.SoftmaxLoss()(model(X), y)
         else:
             h = X.half() @ l1.weight.half()
-            h = h.float() + ops.broadcast_to(ops.reshape(l1.bias, (1, 32)), (16, 32))
+            h = h + ops.broadcast_to(ops.reshape(l1.bias.half(), (1, 32)), (16, 32))
             h = ops.relu(h)
-            o = (h.half() @ l2.weight.half()).float() + ops.broadcast_to(
-                ops.reshape(l2.bias, (1, 4)), (16, 4)
-            )
-            loss = nn.SoftmaxLoss()(o, y)
+            o = h @ l2.weight.half() + ops.broadcast_to(ops.reshape(l2.bias.half(), (1, 4)), (16, 4))
+            with ndl.autocast():  # the loss casts the float16 logits as under autocast
+                loss = nn.SoftmaxLoss()(o, y)
         loss.backward()
         grads[mode] = [loss.numpy()] + [p.grad.numpy() for p in model.parameters()]
         assert all(p.grad.dtype == "float32" for p in model.parameters())

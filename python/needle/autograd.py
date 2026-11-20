@@ -145,6 +145,17 @@ def _autocast_inputs(op: "Op", inputs: List["Value"]) -> List["Value"]:
     ]
 
 
+def autocast_to(x: "Tensor", dtype) -> "Tensor":
+    """Under autocast, `x` cast to `dtype` the way autocast casts op inputs (a
+    parameter is cast once per region and reused); outside autocast, in LAZY_MODE,
+    or when the dtype already matches, `x` itself. Used by modules that combine a
+    parameter with an autocast result, e.g. Linear's bias."""
+    dtype = canonical_dtype(dtype)
+    if not _AUTOCAST.enabled or LAZY_MODE or x.dtype == dtype:
+        return x
+    return _autocast_cast(x, dtype)
+
+
 def autocast_promote(tensors: List["Tensor"]) -> List["Tensor"]:
     """Under autocast, cast a list of tensors to their widest dtype (used by ops
     that take a tuple, e.g. stack); outside autocast the list is returned as is."""

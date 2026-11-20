@@ -104,10 +104,11 @@ def test_autocast_equals_manual_casts(device):
             with ndl.autocast(dtype="bfloat16"):
                 loss = nn.SoftmaxLoss()(model(X), y)
         else:
-            h = (X.bfloat16() @ l1.weight.bfloat16()).float()
-            h = ops.relu(h + ops.broadcast_to(ops.reshape(l1.bias, (1, 32)), (16, 32)))
-            o = (h.bfloat16() @ l2.weight.bfloat16()).float()
-            loss = nn.SoftmaxLoss()(o + ops.broadcast_to(ops.reshape(l2.bias, (1, 4)), (16, 4)), y)
+            h = X.bfloat16() @ l1.weight.bfloat16()
+            h = ops.relu(h + ops.broadcast_to(ops.reshape(l1.bias.bfloat16(), (1, 32)), (16, 32)))
+            o = h @ l2.weight.bfloat16() + ops.broadcast_to(ops.reshape(l2.bias.bfloat16(), (1, 4)), (16, 4))
+            with ndl.autocast(dtype="bfloat16"):  # the loss casts the logits as under autocast
+                loss = nn.SoftmaxLoss()(o, y)
         loss.backward()
         assert all(p.grad.dtype == "float32" for p in model.parameters())
         res[mode] = [loss.numpy()] + [p.grad.numpy() for p in model.parameters()]
