@@ -421,8 +421,9 @@ class Transformer(Module):
         self.checkpoint = checkpoint  # one checkpointed segment per layer
         self.num_layers = num_layers
         self.fp16_release_inputs = fp16_release_inputs
-        # segment_hook(event, index, policy): called with event "start" before and
-        # "end" after each segment runs (policies mode only); used by the profiler
+        # segment_hook(event, index, policy, tensor): called with event "start" and
+        # the segment's input before, and "end" and its output after each segment
+        # runs (policies mode only); used by the profiler
         self.segment_hook = None
         self.policies = None
         self.set_policies(policies)
@@ -474,12 +475,16 @@ class Transformer(Module):
         x = x + pos 
         if self.policies is not None:
             hook = self.segment_hook
+            if x.dtype != "float32":
+                # segment boundaries are float32 (see run_segment); converted here so
+                # that the hook sees the tensor the first segment really reads
+                x = x.astype("float32", release_input=False)
             for i, (layer, policy) in enumerate(zip(self.layers.modules, self.policies)):
                 if hook is not None:
-                    hook("start", i, policy)
+                    hook("start", i, policy, x)
                 x = run_segment(layer, x, policy, self.fp16_release_inputs)
                 if hook is not None:
-                    hook("end", i, policy)
+                    hook("end", i, policy, x)
         elif self.checkpoint:
             for layer in self.layers.modules:
                 x = checkpoint(layer, x)

@@ -14,31 +14,39 @@ time      the change of the step time (forward + backward) when only that segmen
           because an error e in the baseline would move every prediction by
           (n - 1) * e. Rounds over all configurations are repeated `repeats` times
           after `warmup` rounds; CUDA work is synchronised around every timed step.
-memory    from the needle memory counter (NDArray buffers), with the same
-          difference method: peak_delta[i][p] is the change of the step's peak
-          when only segment i switches to p. Also recorded:
-          static               bytes held before the step (parameters, inputs,
-                               optimizer state, ...)
-          base_peak            peak above static of the all-"fp32" step
-          held[i][p], forward_peak[i][p], recompute[i][p]
-                               diagnostics: bytes segment i holds when it returns,
-                               its extra peak while running forward, and (for the
-                               recompute policies "none" / "fp16_none") the memory
-                               it re-materialises in backward
+memory    from the needle memory counter (NDArray buffers), per phase of a step.
+          One instrumented step per policy (every segment at that policy) records,
+          for every segment i, relative to the memory when the phase starts:
+          held[i][p]            bytes the segment's forward leaves allocated
+          forward_peak[i][p]    peak while its forward runs
+          backward_held[i][p]   bytes its backward adds (gradients kept until
+                                backward returns)
+          backward_peak[i][p]   peak while its backward runs (recomputation of
+                                "none" / "fp16_none" segments happens here)
+          and in `fixed` the same for the parts of the model before the first
+          segment ("pre": embeddings) and after the last ("post": output layer,
+          loss). These terms depend on the segment's own policy only, because
+          segment boundaries are float32 whatever the policies.
 
-The models are linear in the per-segment choices, as the optimizer needs:
+The time model is linear in the per-segment choices; the peak is the maximum of
+linear expressions, one per phase of the step:
 
     time(policies) = base_time + sum_i time_delta[i][p_i]
-    peak(policies) = static + base_peak + sum_i peak_delta[i][p_i] + correction
+    peak(policies) = static + max_k (phase_k(policies)) + correction
+    phase_k(policies) = const_k + sum_i coef_k[i][p_i]        (memory_phases())
 
-with time_delta[i]["fp32"] = peak_delta[i]["fp32"] = 0. The peak is additive in
-needle because backward keeps the .grad of every node outside checkpoint segments
-until it ends: memory grows during backward and peaks at its end, when every
-segment's kept activations and gradients are alive and every recomputed segment
-has already been released again (a recompute happens earlier, with fewer gradients
-alive). `correction` is the largest positive residual of the model on calibration
-configs (complete steps with every segment at one policy, by default); it absorbs
-peaks the additive model misses, e.g. if a recompute transient ever set the peak.
+with time_delta[i]["fp32"] = 0. The phases are the forward of the pre part, of each
+segment and of the post part, then the backward of the post part, of each segment
+(last to first) and of the pre part. Memory only grows through backward (needle
+keeps every non-checkpointed node's gradient until backward returns), plus a
+transient while each segment's backward runs; which phase is highest depends on
+the whole configuration (e.g. an fp32 recompute in the middle can exceed a float16
+recompute of the first segment, whose backward runs last), so a sum of per-segment
+peak changes is not a valid model, but "peak <= budget" is still linear: one
+constraint per phase. `correction` is the largest positive residual of the model
+over every complete step measured while profiling (the timed single-switch steps
+and the `calibration` configurations); peak_delta[i][p] (the change of the measured
+peak when only segment i switches to p) is kept as a diagnostic.
 
 Times depend on the device and its kernels: profile on the GPU used for training,
 with tensor cores on (mma=True, the default), since "fp16" is only faster there.
@@ -50,12 +58,17 @@ import json
 import statistics
 import time
 from dataclasses import asdict, dataclass, field
-from typing import Callable, Dict, Iterable, List, Optional, Sequence
+from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
+from ..autograd import backward_hook
 from ..backend_ndarray import ndarray as nd
 from ..nn.nn_transformer import SEGMENT_POLICIES
 
 RECOMPUTE_POLICIES = ("none", "fp16_none")
+# memory of the parts outside the segments (SegmentProfile.fixed): "pre" runs before
+# the first segment (embeddings), "post" after the last (output layer, loss)
+FIXED_TERMS = ("pre_forward_peak", "pre_held", "post_forward_peak", "post_held",
+               "post_backward_peak", "post_backward_held", "pre_backward_peak")
 
 __all__ = ["SegmentProfile", "profile_segments", "measure_step", "ProfileCache"]
 
@@ -73,16 +86,19 @@ class SegmentProfile:
     time_delta: List[Dict[str, float]]  # [segment][policy] seconds vs "fp32"
     time_spread: List[Dict[str, float]]  # [segment][policy] half the min-max range
     forward_time: List[Dict[str, float]]  # [segment][policy] seconds (diagnostic)
-    held: List[Dict[str, int]]  # [segment][policy] bytes (diagnostic)
-    forward_peak: List[Dict[str, int]]  # [segment][policy] bytes (diagnostic)
+    held: List[Dict[str, int]]  # [segment][policy] bytes kept by the forward
+    forward_peak: List[Dict[str, int]]  # [segment][policy] bytes above the forward's start
     recompute: List[Dict[str, int]]  # [segment][recompute policy] bytes (diagnostic)
     static: int  # bytes
     base_peak: int  # bytes above static, every segment "fp32"
-    peak_delta: List[Dict[str, int]]  # [segment][policy] bytes vs "fp32"
+    peak_delta: List[Dict[str, int]]  # [segment][policy] bytes vs "fp32" (diagnostic)
     measured_peak: Dict[str, int] = field(default_factory=dict)  # config -> bytes above static
     correction: int = 0  # bytes
     residuals: Dict[str, int] = field(default_factory=dict)  # config -> measured - modelled
     half_softmax: Optional[bool] = None  # the transformer's half_softmax when profiled
+    backward_held: Optional[List[Dict[str, int]]] = None  # [segment][policy] bytes added by its backward
+    backward_peak: Optional[List[Dict[str, int]]] = None  # [segment][policy] bytes above the backward's start
+    fixed: Optional[Dict[str, int]] = None  # pre / post parts, see FIXED_TERMS
 
     # ------------------------------------------------------------------ models
     def _check(self, policies: Sequence[str]) -> List[str]:
@@ -99,13 +115,45 @@ class SegmentProfile:
         policies = self._check(policies)
         return self.base_time + sum(self.time_delta[i][p] for i, p in enumerate(policies))
 
-    def segment_memory(self, i: int, policy: str) -> int:
-        """The memory term of segment i under `policy` (bytes vs "fp32")."""
-        return self.peak_delta[i][policy]
+    def memory_phases(self) -> List[Tuple[str, int, List[Dict[str, int]]]]:
+        """The phases of a step as (name, const, coef): the memory above `static` in
+        that phase is const + sum_i coef[i][p_i], and the peak is the largest phase
+        (plus `correction`). For the optimizer, "peak <= budget" is one linear
+        constraint per phase."""
+        if self.fixed is None:
+            raise ValueError("this profile predates the phase model; profile again")
+        n, P, f = self.num_segments, self.policies, self.fixed
+        zero = {p: 0 for p in P}
+        held = self.held
+        phases = [("forward pre", f["pre_forward_peak"], [dict(zero) for _ in range(n)])]
+        for j in range(n):
+            coef = [dict(held[i]) if i < j else dict(self.forward_peak[i]) if i == j else dict(zero)
+                    for i in range(n)]
+            phases.append((f"forward segment {j}", f["pre_held"], coef))
+        phases.append(("forward post", f["pre_held"] + f["post_forward_peak"], [dict(held[i]) for i in range(n)]))
+        start = f["pre_held"] + f["post_held"]  # when backward starts
+        phases.append(("backward post", start + f["post_backward_peak"], [dict(held[i]) for i in range(n)]))
+        for j in reversed(range(n)):  # backward runs from the last segment to the first
+            coef = [{p: held[i][p] + (self.backward_held[i][p] if i > j else
+                                      self.backward_peak[i][p] if i == j else 0) for p in P}
+                    for i in range(n)]
+            phases.append((f"backward segment {j}", start + f["post_backward_held"], coef))
+        phases.append(("backward pre", start + f["post_backward_held"] + f["pre_backward_peak"],
+                       [{p: held[i][p] + self.backward_held[i][p] for p in P} for i in range(n)]))
+        return phases
+
+    def peak_phases(self, policies: Sequence[str]) -> Dict[str, int]:
+        """Modelled bytes above `static` in every phase of a step (no correction)."""
+        policies = self._check(policies)
+        return {name: const + sum(coef[i][p] for i, p in enumerate(policies))
+                for name, const, coef in self.memory_phases()}
 
     def _model_peak(self, policies: Sequence[str]) -> int:
-        policies = self._check(policies)
-        return self.base_peak + sum(self.segment_memory(i, p) for i, p in enumerate(policies))
+        if self.fixed is None:
+            # a profile saved before the phase model: sum of single-switch changes
+            policies = self._check(policies)
+            return self.base_peak + sum(self.peak_delta[i][p] for i, p in enumerate(policies))
+        return max(self.peak_phases(policies).values())
 
     def predict_peak(self, policies: Sequence[str], absolute: bool = True) -> int:
         """Modelled peak bytes of a step; absolute=False gives the bytes above `static`."""
@@ -134,18 +182,27 @@ class SegmentProfile:
             return cls.from_dict(json.load(f))
 
     def summary(self) -> str:
+        mib = lambda b: f"{b / 2**20:.1f}"
         lines = [f"segment profile on {self.device} (mma={self.mma}, half_softmax={self.half_softmax}, "
                  f"key={self.key}): "
-                 f"base step {self.base_time * 1e3:.2f} ms, static {self.static / 2**20:.1f} MiB, "
-                 f"base peak {self.base_peak / 2**20:.1f} MiB, correction {self.correction / 2**20:+.2f} MiB"]
+                 f"base step {self.base_time * 1e3:.2f} ms, static {mib(self.static)} MiB, "
+                 f"base peak {mib(self.base_peak)} MiB, correction {self.correction / 2**20:+.2f} MiB"]
+        if self.fixed is not None:
+            f = self.fixed
+            lines.append(f"  pre (embedding): forward peak {mib(f['pre_forward_peak'])}, held {mib(f['pre_held'])}, "
+                         f"backward peak {mib(f['pre_backward_peak'])} MiB | post (output, loss): forward peak "
+                         f"{mib(f['post_forward_peak'])}, held {mib(f['post_held'])}, backward peak "
+                         f"{mib(f['post_backward_peak'])}, held {mib(f['post_backward_held'])} MiB")
+        width = max(len(p) for p in self.policies)
         for i in range(self.num_segments):
-            cols = []
+            lines.append(f"  segment {i}:")
             for p in self.policies:
-                cols.append(f"{p}: {self.time_delta[i][p] * 1e3:+.2f} ms, "
-                            f"peak {self.peak_delta[i][p] / 2**20:+.2f} MiB")
-            lines.append(f"  segment {i}: " + " | ".join(cols)
-                         + "".join(f" | recompute {p} {b / 2**20:.2f} MiB"
-                                   for p, b in self.recompute[i].items()))
+                line = (f"    {p:<{width}}  time {self.time_delta[i][p] * 1e3:+8.2f} ms | forward peak "
+                        f"{mib(self.forward_peak[i][p]):>8}, held {mib(self.held[i][p]):>8} MiB")
+                if self.backward_peak is not None:
+                    line += (f" | backward peak {mib(self.backward_peak[i][p]):>8}, held "
+                             f"{mib(self.backward_held[i][p]):>8} MiB")
+                lines.append(line + f" | step peak {self.peak_delta[i][p] / 2**20:+9.1f} MiB")
         return "\n".join(lines)
 
 
@@ -288,35 +345,83 @@ def _time_switched(transformer, loss_fn, n, switched, prof, device, warmup, repe
     return base_times, diffs, static, base_peak, peaks
 
 
-def _segment_memory(transformer, loss_fn, policy, prof, device):
-    """One forward with every segment at `policy`, recording per segment the bytes
-    held when it returns, its extra peak while running, and its forward time."""
+def _memory_step(transformer, loss_fn, policies, prof, device):
+    """One complete step with the memory of every phase recorded (see the module
+    docstring). Returns (per-segment terms {"held", "forward_peak", "forward_time",
+    "backward_held", "backward_peak"} as lists, fixed terms, the step's peak)."""
     n = transformer.num_layers
-    held, peak, ftime = [0] * n, [0] * n, [0.0] * n
-    state = {}
+    seg = {k: [0] * n for k in ("held", "forward_peak", "backward_held", "backward_peak")}
+    seg["forward_time"] = [0.0] * n
+    fixed = {}
+    state = {"peak": 0}
+    seg_input = {}  # segment index -> id of its input
+    seg_output = {}  # id of a segment's output -> segment index
 
-    def hook(event, i, _policy):
+    def begin():
         device.synchronize()
-        if event == "start":
-            state["mem"] = nd.memory_allocated(device)
-            nd.reset_peak_memory_stats(device)
-            state["t"] = time.perf_counter()
-        else:
-            ftime[i] = time.perf_counter() - state["t"]
-            held[i] = nd.memory_allocated(device) - state["mem"]
-            peak[i] = nd.max_memory_allocated(device) - state["mem"]
+        state["mem"] = nd.memory_allocated(device)
+        state["t"] = time.perf_counter()
+        nd.reset_peak_memory_stats(device)
 
-    transformer.set_policies(policy)
+    def end():
+        """(bytes added, peak above the start) of the running phase."""
+        device.synchronize()
+        state["elapsed"] = time.perf_counter() - state["t"]
+        top = nd.max_memory_allocated(device)
+        state["peak"] = max(state["peak"], top - state["before"])
+        return nd.memory_allocated(device) - state["mem"], top - state["mem"]
+
+    def segment_hook(event, i, _policy, tensor):
+        if event == "start":
+            if i == 0:
+                fixed["pre_held"], fixed["pre_forward_peak"] = end()
+            seg_input[i] = id(tensor)
+            begin()
+        else:
+            seg["held"][i], seg["forward_peak"][i] = end()
+            seg["forward_time"][i] = state["elapsed"]
+            seg_output[id(tensor)] = i
+            begin()
+
+    order = []  # the backward phases in the order they were entered
+
+    def node_hook(node):
+        j = seg_output.get(id(node))
+        if j is None and n and id(node) == seg_input[0]:
+            j = -1  # the input of the first segment: the pre part's backward starts
+        if j is None:
+            return
+        added, top = end()
+        prev = order[-1] if order else n  # n: the post part
+        if prev == n:
+            fixed["post_backward_held"], fixed["post_backward_peak"] = added, top
+        else:
+            seg["backward_held"][prev], seg["backward_peak"][prev] = added, top
+        order.append(j)
+        begin()
+
+    _set_policies(transformer, policies)
     prof.clear_grads()
     gc.collect()
-    transformer.segment_hook = hook
+    device.synchronize()
+    state["before"] = nd.memory_allocated(device)
+    begin()
+    transformer.segment_hook = segment_hook
     try:
         loss = loss_fn()
+        fixed["post_held"], fixed["post_forward_peak"] = end()
+        begin()
+        with backward_hook(node_hook):
+            loss.backward()
+        _, fixed["pre_backward_peak"] = end()
     finally:
         transformer.segment_hook = None
+    if order != list(reversed(range(-1, n))):
+        raise RuntimeError(f"segment boundaries not found in backward in the expected order: {order}")
     del loss
+    prof.clear_grads()
     gc.collect()
-    return held, peak, ftime
+    return seg, fixed, state["peak"]
 
 
 def profile_segments(transformer, loss_fn: Callable, params: Optional[Iterable] = None,
@@ -339,7 +444,8 @@ def profile_segments(transformer, loss_fn: Callable, params: Optional[Iterable] 
         whether fp16 matmuls actually used tensor cores (False on GPUs before sm_70).
     key: label of what was profiled (e.g. the input shape), stored in the result.
     calibration: policy configurations whose measured peaks calibrate the memory
-        model's correction term (default: every policy on every segment).
+        model's correction term, in addition to the timed single-switch steps
+        (default: every policy on every segment).
     """
     policies = list(policies)
     if "fp32" not in policies:
@@ -358,15 +464,19 @@ def profile_segments(transformer, loss_fn: Callable, params: Optional[Iterable] 
         if device.mod is not None and hasattr(device.mod, "mma_enabled"):
             mma_state = bool(device.mod.mma_enabled()) and bool(device.mod.mma_available("float16"))
 
-        # memory per segment and policy (forward with every segment at one policy)
-        held = [dict() for _ in range(n)]
-        fpeak = [dict() for _ in range(n)]
-        ftime = [dict() for _ in range(n)]
+        # memory per phase: one instrumented step with every segment at one policy
+        terms = {k: [dict() for _ in range(n)]
+                 for k in ("held", "forward_peak", "forward_time", "backward_held", "backward_peak")}
+        fixed = {}
         for p in policies:
-            h, pk, ft = _segment_memory(transformer, loss_fn, p, prof, device)
-            for i in range(n):
-                held[i][p], fpeak[i][p], ftime[i][p] = h[i], pk[i], ft[i]
-        recompute = [{p: fpeak[i][p] for p in RECOMPUTE_POLICIES if p in policies} for i in range(n)]
+            seg, fx, _ = _memory_step(transformer, loss_fn, p, prof, device)
+            for k, values in seg.items():
+                for i in range(n):
+                    terms[k][i][p] = values[i]
+            for k, v in fx.items():  # the same in every run; keep the largest
+                fixed[k] = max(fixed.get(k, v), v)
+        recompute = [{p: terms["forward_peak"][i][p] for p in RECOMPUTE_POLICIES if p in policies}
+                     for i in range(n)]
 
         # time and peak: one segment switched at a time, paired with baseline steps
         switched = [(i, p) for i in range(n) for p in policies if p != "fp32"]
@@ -376,14 +486,17 @@ def profile_segments(transformer, loss_fn: Callable, params: Optional[Iterable] 
         delta = [{"fp32": 0.0} for _ in range(n)]
         spread = [{"fp32": (max(base_times) - min(base_times)) / 2} for _ in range(n)]
         pdelta = [{"fp32": 0} for _ in range(n)]
+        # measured peaks of complete steps, to calibrate the correction term
+        measured = {_config_name(["fp32"] * n): base_peak}
         for (i, p), d in diffs.items():
             delta[i][p] = statistics.median(d)
             spread[i][p] = (max(d) - min(d)) / 2
             pdelta[i][p] = peaks[(i, p)] - base_peak
+            config = ["fp32"] * n
+            config[i] = p
+            measured[_config_name(config)] = peaks[(i, p)]
 
-        # measured peaks of complete steps, to calibrate the correction term
         configs = calibration if calibration is not None else [[p] * n for p in policies]
-        measured = {}
         for config in configs:
             _, st, pk = _time_config(transformer, loss_fn, config, prof, device, 0, 1)
             static = min(static, st)
@@ -391,10 +504,12 @@ def profile_segments(transformer, loss_fn: Callable, params: Optional[Iterable] 
 
     profile = SegmentProfile(
         policies=policies, num_segments=n, device=device.name, key=key, mma=mma_state,
-        base_time=base_time, time_delta=delta, time_spread=spread, forward_time=ftime,
-        held=held, forward_peak=fpeak, recompute=recompute, static=static,
-        half_softmax=getattr(transformer, "half_softmax", None),
+        base_time=base_time, time_delta=delta, time_spread=spread,
+        forward_time=terms["forward_time"], held=terms["held"], forward_peak=terms["forward_peak"],
+        recompute=recompute, static=static, half_softmax=getattr(transformer, "half_softmax", None),
         base_peak=base_peak, peak_delta=pdelta, measured_peak=measured,
+        backward_held=terms["backward_held"], backward_peak=terms["backward_peak"],
+        fixed={k: fixed[k] for k in FIXED_TERMS},
     )
     residual = {name: pk - profile._model_peak(name.split(",")) for name, pk in measured.items()}
     profile.correction = max(0, max(residual.values())) if residual else 0

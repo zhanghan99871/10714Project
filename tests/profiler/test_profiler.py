@@ -1,4 +1,5 @@
 """needle.policy profiler: per-segment time and memory costs of the segment policies."""
+import gc
 import sys
 import time
 
@@ -9,6 +10,7 @@ import pytest
 
 import needle as ndl
 import needle.nn as nn
+from needle.backend_ndarray import ndarray as nd
 from needle.policy import ProfileCache, SegmentProfile, measure_step, profile_segments
 
 _HAS_GPU = ndl.cuda().enabled()
@@ -44,6 +46,23 @@ def cpu_profile():
 # --------------------------------------------------------------------------- plumbing
 
 
+def test_backward_hook_sees_every_node_in_order():
+    from needle.autograd import backward_hook, find_topo_sort
+
+    a = ndl.Tensor(np.ones((2, 3), dtype=np.float32), requires_grad=True)
+    loss = (ndl.ops.exp(a * 2) + a).sum()
+    seen, inner = [], []
+    with backward_hook(seen.append):
+        with backward_hook(inner.append):  # nested: the inner hook replaces the outer one
+            loss.backward()
+        loss.backward()
+    expected = [v for v in reversed(find_topo_sort([loss])) if v.requires_grad]
+    assert inner == expected and seen == expected
+    seen.clear()
+    loss.backward()  # removed on exit
+    assert seen == []
+
+
 @pytest.mark.parametrize("device", _DEVICES, ids=_IDS)
 def test_synchronize(device):
     device.synchronize()  # no-op on cpu / numpy, cudaDeviceSynchronize on cuda
@@ -55,8 +74,12 @@ def test_segment_hook_events(device):
     events = []
     m.sequence_model.segment_hook = lambda *e: events.append(e)
     loss_fn()
-    assert events == [("start", 0, "fp32"), ("end", 0, "fp32"), ("start", 1, "fp16"),
-                      ("end", 1, "fp16"), ("start", 2, "none"), ("end", 2, "none")]
+    assert [e[:3] for e in events] == [("start", 0, "fp32"), ("end", 0, "fp32"), ("start", 1, "fp16"),
+                                      ("end", 1, "fp16"), ("start", 2, "none"), ("end", 2, "none")]
+    # the boundary tensors: each segment's input is the previous segment's output
+    tensors = [e[3] for e in events]
+    assert all(isinstance(t, ndl.Tensor) and t.dtype == "float32" for t in tensors)
+    assert tensors[2] is tensors[1] and tensors[4] is tensors[3]
     events.clear()
     m.sequence_model.set_policies(None)  # no segments without policies
     loss_fn()
@@ -74,9 +97,19 @@ def test_profile_structure(cpu_profile):
         assert set(prof.time_delta[i]) == set(prof.peak_delta[i]) == {"fp32", "fp16", "none", "fp16_none"}
         assert set(prof.recompute[i]) == {"none", "fp16_none"}
         assert all(v >= 0 for v in prof.time_spread[i].values())
-    assert set(prof.measured_peak) == {"fp32,fp32,fp32", "fp16,fp16,fp16", "none,none,none",
-                                       "fp16_none,fp16_none,fp16_none"}
+    # calibration: the uniform configurations and every timed single-switch step
+    uniform = {",".join([p] * LAYERS) for p in prof.policies}
+    single = {",".join(p if k == i else "fp32" for k in range(LAYERS))
+              for i in range(LAYERS) for p in prof.policies}
+    assert set(prof.measured_peak) == uniform | single == set(prof.residuals)
     assert prof.correction >= 0
+    assert set(prof.fixed) == {"pre_forward_peak", "pre_held", "post_forward_peak", "post_held",
+                               "post_backward_peak", "post_backward_held", "pre_backward_peak"}
+    phases = prof.memory_phases()
+    assert len(phases) == 2 * LAYERS + 4
+    assert [name for name, _, _ in phases] == (
+        ["forward pre"] + [f"forward segment {j}" for j in range(LAYERS)] + ["forward post", "backward post"]
+        + [f"backward segment {j}" for j in reversed(range(LAYERS))] + ["backward pre"])
 
 
 def test_memory_costs_are_ordered(cpu_profile):
@@ -88,6 +121,11 @@ def test_memory_costs_are_ordered(cpu_profile):
         # recompute re-materialises the interior, in float16 for "fp16_none"
         assert held["none"] < rec["fp16_none"] < rec["none"]
         assert prof.forward_peak[i]["fp32"] >= prof.held[i]["fp32"]
+        # backward keeps every gradient of a kept segment, few of a recomputed one,
+        # but has to re-materialise the recomputed segment's activations meanwhile
+        bh, bp = prof.backward_held[i], prof.backward_peak[i]
+        assert bh["fp16_none"] < bh["none"] < bh["fp16"] < bh["fp32"]
+        assert bp["none"] > 3 * bh["none"] and bp["fp16_none"] > 3 * bh["fp16_none"]
 
 
 def test_state_restored(cpu_profile):
@@ -130,45 +168,112 @@ def test_argument_checks(cpu_profile):
 
 @pytest.mark.parametrize("device", _DEVICES, ids=_IDS)
 def test_peak_model_matches_measured_steps(device):
-    """The additive peak model reproduces the measured peak of complete steps for
-    mixed policies it was never calibrated on."""
+    """The phase model reproduces the measured peak of complete steps for mixed
+    policies it was never calibrated on (needle's memory counter is deterministic,
+    so exactly)."""
     m, loss_fn = setup(device)
     prof = profile_segments(m.sequence_model, loss_fn, params=m.parameters(), warmup=0, repeats=1)
+    assert prof.correction == 0 and set(prof.residuals.values()) == {0}
     rng = np.random.RandomState(0)
-    for _ in range(5):
+    for _ in range(6):
         pol = list(rng.choice(["fp32", "fp16", "none", "fp16_none"], LAYERS))
         measured = measure_step(m.sequence_model, loss_fn, pol, params=m.parameters(),
                                 warmup=0, repeats=1)
         predicted = prof.predict_peak(pol, absolute=False)
-        assert predicted >= measured["peak"]  # the correction never under-predicts
-        assert predicted <= 1.02 * measured["peak"], (pol, predicted, measured["peak"])
+        assert predicted == measured["peak"], (pol, predicted, measured["peak"])
         assert prof.predict_peak(pol) == predicted + prof.static
-    # without its correction the model already reproduces the calibration peaks
-    assert set(prof.residuals) == set(prof.measured_peak)
-    assert max(abs(r) for r in prof.residuals.values()) <= 0.02 * prof.base_peak, prof.residuals
+
+
+def test_peak_moves_between_phases():
+    """With segment 0 at "fp16_none" and segment 1 at "none", the peak is the fp32
+    recompute of segment 1 (while segment 2's gradients are alive), not the end of
+    backward or the recompute of segment 0 where every single-switch step peaks: a
+    sum of single-switch peak changes under-predicts it, the phase model does not."""
+    from models import LanguageModel
+
+    dev = ndl.cpu()
+    np.random.seed(0)
+    m = LanguageModel(48, 100, 128, num_layers=LAYERS, seq_model="transformer", seq_len=96,
+                      device=dev, policies="fp32", half_softmax=True)
+    rng = np.random.RandomState(1)
+    x = ndl.Tensor(rng.randint(0, 100, (96, 2)), device=dev, requires_grad=False)
+    y = ndl.Tensor(rng.randint(0, 100, 192), device=dev, requires_grad=False)
+    loss_fn = lambda: nn.SoftmaxLoss()(m(x)[0], y)
+    prof = profile_segments(m.sequence_model, loss_fn, params=m.parameters(), warmup=0, repeats=1)
+    for third in ("fp32", "fp16", "none", "fp16_none"):
+        pol = ["fp16_none", "none", third]
+        measured = measure_step(m.sequence_model, loss_fn, pol, params=m.parameters(),
+                                warmup=0, repeats=1)["peak"]
+        assert prof.predict_peak(pol, absolute=False) == measured
+        phases = prof.peak_phases(pol)
+        assert max(phases, key=phases.get) == "backward segment 1"
+        additive = prof.base_peak + sum(prof.peak_delta[i][p] for i, p in enumerate(pol))
+        assert additive < measured
+
+
+def test_memory_phases_are_linear(cpu_profile):
+    """memory_phases() is the optimizer's form of the model: for any configuration,
+    const + sum_i coef[i][p_i] of every phase equals peak_phases(), and the peak is
+    their maximum plus the correction."""
+    _, _, prof = cpu_profile
+    rng = np.random.RandomState(1)
+    for _ in range(10):
+        pol = list(rng.choice(prof.policies, LAYERS))
+        by_name = prof.peak_phases(pol)
+        for name, const, coef in prof.memory_phases():
+            assert by_name[name] == const + sum(coef[i][p] for i, p in enumerate(pol))
+            assert all(set(c) == set(prof.policies) for c in coef)
+        assert prof.predict_peak(pol, absolute=False) == max(by_name.values()) + prof.correction
+    assert max(prof.peak_phases("fp32").values()) == prof.base_peak
+
+
+def test_forward_phases_match_forward_only_peak(cpu_profile):
+    """The forward phases alone reproduce the peak of a forward pass (in these models
+    the backward is always higher, so the step peak does not test them)."""
+    m, loss_fn, prof = cpu_profile
+    tr, dev = m.sequence_model, ndl.cpu()
+    rng = np.random.RandomState(2)
+    for _ in range(8):
+        pol = list(rng.choice(prof.policies, LAYERS))
+        tr.set_policies(pol)
+        gc.collect()
+        before = nd.memory_allocated(dev)
+        nd.reset_peak_memory_stats(dev)
+        loss = loss_fn()
+        measured = nd.max_memory_allocated(dev) - before
+        del loss
+        phases = prof.peak_phases(pol)
+        assert max(v for k, v in phases.items() if k.startswith("forward")) == measured, pol
+    tr.set_policies("fp32")
 
 
 def test_correction_covers_interactions():
-    """Memory the single-switch measurements cannot see (here 1 MiB allocated only
-    when every segment recomputes) shows up as a calibration residual, and the
-    correction lifts the predictions so the peak is not under-predicted."""
+    """Memory the per-policy measurements cannot see (here 1 MiB allocated only for
+    one mixed configuration) shows up as the residual of a calibration step, and the
+    correction lifts the predictions so that peak is not under-predicted."""
     dev = ndl.cpu()
     m, loss_fn = setup(dev)
     tr = m.sequence_model
     extra_bytes = 1 << 20
+    odd = ["none", "fp32", "none"]
 
     def interacting_loss():
         loss = loss_fn()
-        if tr.policies == ["none"] * LAYERS:
+        if tr.policies == odd:
             # held by the loss tensor, i.e. for the whole step
             loss.extra = ndl.init.zeros(extra_bytes // 4, device=dev, requires_grad=False)
         return loss
 
-    prof = profile_segments(tr, interacting_loss, params=m.parameters(), warmup=0, repeats=1)
-    assert prof.residuals["none,none,none"] == pytest.approx(extra_bytes, rel=0.05)
-    assert prof.correction == max(prof.residuals.values())
-    measured = measure_step(tr, interacting_loss, "none", params=m.parameters(), warmup=0, repeats=1)
-    assert prof.predict_peak("none", absolute=False) >= measured["peak"]
+    plain = profile_segments(tr, interacting_loss, params=m.parameters(), warmup=0, repeats=1)
+    assert plain.correction == 0  # no profiled step sees the extra memory
+    prof = profile_segments(tr, interacting_loss, params=m.parameters(), warmup=0, repeats=1,
+                            calibration=[odd, ["fp16"] * LAYERS])
+    assert prof.residuals["none,fp32,none"] == extra_bytes
+    assert prof.residuals["fp16,fp16,fp16"] == 0
+    assert prof.correction == extra_bytes
+    measured = measure_step(tr, interacting_loss, odd, params=m.parameters(), warmup=0, repeats=1)
+    assert prof.predict_peak(odd, absolute=False) == measured["peak"]
+    assert plain.predict_peak(odd, absolute=False) == measured["peak"] - extra_bytes
 
 
 def test_time_model(cpu_profile):
@@ -233,7 +338,8 @@ def test_custom_calibration_configs():
     configs = [["fp32", "fp16", "none"], ["none", "none", "fp32"]]
     prof = profile_segments(m.sequence_model, loss_fn, params=m.parameters(), warmup=0,
                             repeats=1, calibration=configs)
-    assert set(prof.measured_peak) == {"fp32,fp16,none", "none,none,fp32"}
+    assert {"fp32,fp16,none", "none,none,fp32"} <= set(prof.measured_peak)
+    assert "none,none,none" not in prof.measured_peak  # replaced the uniform defaults
 
 
 # --------------------------------------------------------------------------- persistence / cache
@@ -248,15 +354,25 @@ def test_save_load_round_trip(cpu_profile, tmp_path):
     for pol in (["fp32", "fp16", "none"], "none", "fp16_none"):
         assert loaded.predict_peak(pol) == prof.predict_peak(pol)
         assert loaded.predict_time(pol) == prof.predict_time(pol)
-    assert "segment 0" in prof.summary() and "recompute fp16_none" in prof.summary()
-    # profiles saved before "fp16_none" stored one recompute number per segment
+    text = prof.summary()
+    assert "segment 0" in text and "fp16_none" in text and "backward peak" in text
+    # profiles saved before "fp16_none" and the phase model: one recompute number
+    # per segment, no backward / fixed terms; they predict with the old sum of
+    # single-switch peak changes
     old = prof.to_dict()
     old["policies"] = ["fp32", "fp16", "none"]
     old["recompute"] = [r["none"] for r in prof.recompute]
-    del old["half_softmax"]
+    for k in ("half_softmax", "backward_held", "backward_peak", "fixed"):
+        del old[k]
     legacy = SegmentProfile.from_dict(old)
     assert legacy.recompute == [{"none": r["none"]} for r in prof.recompute]
-    assert legacy.half_softmax is None and "recompute none" in legacy.summary()
+    assert legacy.half_softmax is None and legacy.fixed is None
+    pol = ["none", "fp16", "fp32"]
+    assert legacy.predict_peak(pol, absolute=False) == (
+        prof.base_peak + sum(prof.peak_delta[i][p] for i, p in enumerate(pol)) + prof.correction)
+    assert "segment 0" in legacy.summary()
+    with pytest.raises(ValueError, match="phase model"):
+        legacy.memory_phases()
 
 
 def test_half_softmax_recorded_and_cheaper():

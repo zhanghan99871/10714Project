@@ -91,16 +91,18 @@ def main():
     configs = [[p] * n for p in policies] + [list(rng.choice(policies, n)) for _ in range(args.check)]
     width = max(len(",".join(c)) for c in configs) + 1
     print(f"\n{'policies':<{width}} {'time pred':>10} {'measured':>10} {'err':>7}   "
-          f"{'peak pred':>10} {'measured':>10} {'err':>7}")
+          f"{'peak pred':>10} {'measured':>10} {'err':>7}   peak phase")
     t_err, p_err = [], []
     for config in configs:
         r = measure_step(tr, loss_fn, config, params=model.parameters(), warmup=args.warmup,
                          repeats=args.repeats, mma=mma)
         tp, pp = prof.predict_time(config), prof.predict_peak(config, absolute=False)
+        phases = prof.peak_phases(config)
+        phase = max(phases, key=phases.get)
         t_err.append(tp / r["time"] - 1)
         p_err.append(pp / r["peak"] - 1)
         print(f"{','.join(config):<{width}} {tp * 1e3:8.2f}ms {r['time'] * 1e3:8.2f}ms {t_err[-1]:+7.1%}   "
-              f"{pp / MB:8.1f}MB {r['peak'] / MB:8.1f}MB {p_err[-1]:+7.1%}")
+              f"{pp / MB:8.1f}MB {r['peak'] / MB:8.1f}MB {p_err[-1]:+7.1%}   {phase}")
     abs_t, abs_p = np.abs(t_err), np.abs(p_err)
     print(f"\ntime error: mean {abs_t.mean():.1%}, max {abs_t.max():.1%};  "
           f"peak error: mean {abs_p.mean():.2%}, max {abs_p.max():.2%} "
