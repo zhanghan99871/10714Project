@@ -850,6 +850,12 @@ PYBIND11_MODULE(ndarray_backend_cuda, m) {
   m.def("matmul", Matmul);
   m.def("matmul_batched", MatmulBatched);
 
+  // wait for all queued kernels (kernel launches are asynchronous): needed to time GPU work
+  m.def("synchronize", [] {
+    cudaError_t err = cudaDeviceSynchronize();
+    if (err != cudaSuccess) throw std::runtime_error(cudaGetErrorString(err));
+  });
+
   // tensor core matmul for float16 / bfloat16
   m.def("mma_available", [](const std::string& dtype) { return MmaAvailable(ParseDType(dtype)); },
         "whether matmuls of this dtype run on the tensor cores on this GPU");
