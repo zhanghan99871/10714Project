@@ -75,6 +75,13 @@ class BackendDevice:
     def __getattr__(self, name: str) -> Any:
         return getattr(self.mod, name)
 
+    def synchronize(self) -> None:
+        """Wait until all work queued on this device has finished (CUDA kernels are
+        launched asynchronously). A no-op for the synchronous cpu / numpy backends."""
+        fn = getattr(self.mod, "synchronize", None)
+        if fn is not None:
+            fn()
+
     def enabled(self) -> bool:
         return self.mod is not None
 

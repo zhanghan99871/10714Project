@@ -11,5 +11,6 @@ from . import data
 from . import nn
 from . import optim
 from . import amp
+from . import policy
 from .amp import autocast, is_autocast_enabled, get_autocast_dtype, GradScaler
 from .backend_selection import *

@@ -28,7 +28,14 @@ class MultiHeadAttention(Module):
         causal = False,
         device = None,
         dtype = "float32",
+        half_softmax = False,
     ):
+        """
+        half_softmax: when the attention logits are float16 / bfloat16 (e.g. under
+            autocast), compute the softmax with the fused ops.softmax and keep its
+            output in that dtype, instead of the op-by-op softmax whose exp and sums
+            autocast runs in float32. Float32 logits always use the op-by-op softmax.
+        """
 
         super().__init__()
 
@@ -37,6 +44,7 @@ class MultiHeadAttention(Module):
 
         self.causal = causal
         self.dropout = Dropout(dropout)
+        self.half_softmax = half_softmax
 
     @staticmethod
     def causal_mask_value(dtype="float32"):
@@ -82,6 +90,10 @@ class MultiHeadAttention(Module):
         """
         The softmax function; 
         """
+        if self.half_softmax and logit.dtype in ("float16", "bfloat16"):
+            # one op in the logits' dtype; the op-by-op version below is not safe
+            # in float16 (see ops.Softmax) and autocast would run it in float32
+            return ops.softmax(logit, axis=3)
         max_val = Tensor(
             logit.realize_cached_data().max(axis=3),
             device=logit.device,
@@ -318,24 +330,30 @@ class TransformerLayer(Module):
 
 
 # Execution policies of one segment (one TransformerLayer), see run_segment:
-#   "fp32"  run in float32 and keep the activations
-#   "fp16"  run under autocast(float16) and keep the (mostly float16) activations
-#   "none"  run in float32 under checkpoint(): keep only the segment boundary and
-#           recompute the activations during backward (gradients bit-identical to "fp32")
-SEGMENT_POLICIES = ("fp32", "fp16", "none")
+#   "fp32"       run in float32 and keep the activations
+#   "fp16"       run under autocast(float16) and keep the (mostly float16) activations
+#   "none"       run in float32 under checkpoint(): keep only the segment boundary and
+#                recompute the activations during backward (gradients bit-identical
+#                to "fp32")
+#   "fp16_none"  run under autocast(float16) and checkpoint(): keep only the segment
+#                boundary and recompute the float16 activations during backward
+#                (gradients bit-identical to "fp16")
+SEGMENT_POLICIES = ("fp32", "fp16", "none", "fp16_none")
+FP16_POLICIES = ("fp16", "fp16_none")
 
 
 def run_segment(fn, x, policy: str, release_inputs: bool = True):
     """Run fn(x) as one segment under `policy` (see SEGMENT_POLICIES).
 
     The precision is set by the policy, also inside an enclosing autocast region:
-    "fp32" and "none" disable autocast, "fp16" enables it with float16. Segment
+    "fp32" and "none" disable autocast, "fp16" and "fp16_none" enable it with
+    float16; "none" and "fp16_none" run fn under checkpoint(). Segment
     boundaries are float32: the input is converted on entry (an enclosing autocast
     region may have produced it in half precision, e.g. an embedding matmul) and the
     result is returned as float32, so the policy of one segment does not change the
     inputs of the next. The parameters of fn are expected to be float32.
 
-    release_inputs: for "fp16", let the casts that autocast inserts release their
+    release_inputs: for "fp16" / "fp16_none", let the casts that autocast inserts release their
     (non-leaf) inputs, so that the float32 copies of the segment's activations are
     freed and the segment keeps mostly float16 data.
 
@@ -349,9 +367,9 @@ def run_segment(fn, x, policy: str, release_inputs: bool = True):
         # outside the segment (and before checkpoint), so it is not recomputed
         x = x.astype("float32", release_input=False)
     x._keep_cached = True
-    if policy == "fp16":
+    if policy in FP16_POLICIES:
         with autocast(dtype="float16", release_inputs=release_inputs):
-            out = fn(x)
+            out = checkpoint(fn, x) if policy == "fp16_none" else fn(x)
     else:
         with autocast(enabled=False):
             out = checkpoint(fn, x) if policy == "none" else fn(x)
@@ -379,15 +397,20 @@ class Transformer(Module):
         checkpoint = False,
         policies = None,
         fp16_release_inputs = True,
+        half_softmax = False,
     ):
         """
         checkpoint: one checkpointed segment per layer, run under whatever autocast
             region encloses the model (used when policies is None).
-        policies: per-layer segment policies ("fp32" / "fp16" / "none", see
-            SEGMENT_POLICIES): a list with one entry per layer, or one string for
-            all layers. None (default) keeps the behaviour selected by `checkpoint`.
-            Change them between steps with set_policies().
-        fp16_release_inputs: release_inputs of the autocast region of "fp16" segments.
+        policies: per-layer segment policies ("fp32" / "fp16" / "none" /
+            "fp16_none", see SEGMENT_POLICIES): a list with one entry per layer, or
+            one string for all layers. None (default) keeps the behaviour selected by
+            `checkpoint`. Change them between steps with set_policies().
+        fp16_release_inputs: release_inputs of the autocast region of "fp16" and
+            "fp16_none" segments.
+        half_softmax: run the attention softmax of half-precision segments in
+            float16 (fused ops.softmax) instead of float32; float32 segments are not
+            affected. Can be changed between steps (the half_softmax attribute).
         """
 
         super().__init__()
@@ -398,6 +421,10 @@ class Transformer(Module):
         self.checkpoint = checkpoint  # one checkpointed segment per layer
         self.num_layers = num_layers
         self.fp16_release_inputs = fp16_release_inputs
+        # segment_hook(event, index, policy, tensor): called with event "start" and
+        # the segment's input before, and "end" and its output after each segment
+        # runs (policies mode only); used by the profiler
+        self.segment_hook = None
         self.policies = None
         self.set_policies(policies)
 
@@ -418,6 +445,7 @@ class Transformer(Module):
             for _ in range(num_layers)
         ])
         ### END YOUR SOLUTION
+        self.half_softmax = half_softmax
 
     def forward(
         self,
@@ -446,8 +474,17 @@ class Transformer(Module):
         pos = self.pos_embed(position_ids) 
         x = x + pos 
         if self.policies is not None:
-            for layer, policy in zip(self.layers.modules, self.policies):
+            hook = self.segment_hook
+            if x.dtype != "float32":
+                # segment boundaries are float32 (see run_segment); converted here so
+                # that the hook sees the tensor the first segment really reads
+                x = x.astype("float32", release_input=False)
+            for i, (layer, policy) in enumerate(zip(self.layers.modules, self.policies)):
+                if hook is not None:
+                    hook("start", i, policy, x)
                 x = run_segment(layer, x, policy, self.fp16_release_inputs)
+                if hook is not None:
+                    hook("end", i, policy, x)
         elif self.checkpoint:
             for layer in self.layers.modules:
                 x = checkpoint(layer, x)
@@ -490,4 +527,16 @@ class Transformer(Module):
     @property
     def needs_loss_scaling(self) -> bool:
         """True when some segment runs in float16 (train with a GradScaler)."""
-        return self.policies is not None and "fp16" in self.policies
+        return self.policies is not None and any(p in FP16_POLICIES for p in self.policies)
+
+    @property
+    def half_softmax(self) -> bool:
+        """Whether the attention softmax of half-precision segments runs in float16
+        (see MultiHeadAttention); assigning it switches every layer."""
+        return self._half_softmax
+
+    @half_softmax.setter
+    def half_softmax(self, flag: bool) -> None:
+        self._half_softmax = bool(flag)
+        for layer in self.layers.modules:
+            layer.attn_layer.attn.half_softmax = self._half_softmax

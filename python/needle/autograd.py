@@ -231,6 +231,42 @@ class _CheckpointState:
 _CHECKPOINT = _CheckpointState()
 
 
+##############################
+####### Backward hook ########
+##############################
+
+
+class _BackwardHookState:
+    def __init__(self):
+        self.hook = None
+
+
+_BACKWARD_HOOK = _BackwardHookState()
+
+
+class backward_hook:
+    """Context manager: call fn(node) right before backward processes each node
+    that requires grad (in reverse topological order), e.g. to measure memory per
+    part of the graph (needle.policy's profiler). One hook at a time; the previous
+    one is restored on exit.
+
+        with backward_hook(lambda node: print(node.op)):
+            loss.backward()
+    """
+
+    def __init__(self, fn):
+        self.fn = fn
+
+    def __enter__(self):
+        self.saved = _BACKWARD_HOOK.hook
+        _BACKWARD_HOOK.hook = self.fn
+        return self
+
+    def __exit__(self, *exc):
+        _BACKWARD_HOOK.hook = self.saved
+        return False
+
+
 class _AutocastDisabled:
     """Internal: suspend autocast (backward always runs in the forward dtypes)."""
 
@@ -779,9 +815,12 @@ def _compute_gradient_of_variables(output_tensor, out_grad):
 
     ### BEGIN YOUR SOLUTION
     # raise NotImplementedError()
+    hook = _BACKWARD_HOOK.hook
     for each in reverse_topo_order:
         if not each.requires_grad:
             continue
+        if hook is not None:
+            hook(each)
         each.grad = _sum_adjoints(node_to_output_grads_list[each])
         if each.op is None:
             continue
