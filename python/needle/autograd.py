@@ -397,6 +397,9 @@ class Value:
         # checkpoint() records the nodes inside the segment
         # a node is recorded if it 1. is not a leaf 2. requires gradient 3. inside a segment 
         self._checkpoint_interior = False
+        # segment inputs / outputs (see nn.run_segment): casts must not release them,
+        # or the next read would recompute the whole previous segment during forward
+        self._keep_cached = False
         if op is not None and requires_grad and _CHECKPOINT.record is not None:
             _CHECKPOINT.record.append(self)
 

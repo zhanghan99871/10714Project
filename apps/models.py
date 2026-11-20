@@ -62,7 +62,8 @@ class ResNet9(ndl.nn.Module):
 
 class LanguageModel(nn.Module):
     def __init__(self, embedding_size, output_size, hidden_size, num_layers=1,
-                 seq_model='rnn', seq_len=40, device=None, dtype="float32", checkpoint=False):
+                 seq_model='rnn', seq_len=40, device=None, dtype="float32", checkpoint=False,
+                 policies=None):
         """
         Consists of an embedding layer, a sequence model (either RNN or LSTM), and a
         linear layer.
@@ -73,6 +74,8 @@ class LanguageModel(nn.Module):
         seq_model: 'rnn' or 'lstm', whether to use RNN or LSTM
         num_layers: Number of layers in RNN or LSTM
         checkpoint: transformer only: one checkpointed segment per layer
+        policies: transformer only: per-layer segment policies ("fp32" / "fp16" /
+            "none"), see nn.Transformer and set_policies()
         """
         super(LanguageModel, self).__init__()
         ### BEGIN YOUR SOLUTION
@@ -83,7 +86,8 @@ class LanguageModel(nn.Module):
         elif seq_model == 'lstm':
             self.sequence_model = nn.LSTM(embedding_size, hidden_size, num_layers=num_layers, device=device, dtype=dtype)
         elif seq_model == 'transformer':
-            self.sequence_model = nn.Transformer(embedding_size, hidden_size, num_layers=num_layers, device=device, dtype=dtype, checkpoint=checkpoint)
+            self.sequence_model = nn.Transformer(embedding_size, hidden_size, num_layers=num_layers, device=device, dtype=dtype, checkpoint=checkpoint,
+                                                 policies=policies)
         if seq_model == 'transformer':
             self.final_proj = nn.Linear(embedding_size, output_size, device=device, dtype=dtype)
         else:
@@ -93,6 +97,12 @@ class LanguageModel(nn.Module):
         self.output_size = output_size
         self.hidden_size = hidden_size
         ### END YOUR SOLUTION
+
+    def set_policies(self, policies):
+        """Per-layer segment policies of the transformer (see nn.Transformer.set_policies)."""
+        if not self.is_transformer:
+            raise ValueError("segment policies are only supported for seq_model='transformer'")
+        self.sequence_model.set_policies(policies)
 
     def forward(self, x, h=None):
         """
