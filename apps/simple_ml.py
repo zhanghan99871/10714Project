@@ -14,6 +14,7 @@ from apps.models import *
 import time
 import contextlib
 device = ndl.cpu()
+import tqdm 
 
 def parse_mnist(image_filename, label_filename):
     """Read an images and labels file in MNIST format.  See this page:
@@ -352,7 +353,7 @@ def epoch_general_ptb(data, model, seq_len=40, loss_fn=nn.SoftmaxLoss(), opt=Non
         device = model.parameters()[0].device
     h = None 
     scaler = _make_scaler(amp, opt, scaler)
-    for i in range(0, data.shape[0] - 1, seq_len):
+    for i in tqdm.tqdm(range(0, data.shape[0] - 1, seq_len)):
         X, y = get_batch(data, i, seq_len, device=device, dtype=dtype)
         with _grad_context(opt), _amp_context(amp):
             output, h = model(X, h) 
@@ -429,7 +430,7 @@ def train_ptb(model, data, seq_len=40, n_epochs=1, optimizer=ndl.optim.SGD,
         scaler = ndl.amp.GradScaler(enabled=_amp_dtype(amp) == "float16")
     if controller is not None and device is None:
         device = model.parameters()[0].device
-    for i in range(n_epochs):
+    for i in tqdm.tqdm(range(n_epochs)):
         if controller is not None:
             from needle.policy import sample_ptb_batches
             controller.before_epoch(i, lambda: sample_ptb_batches(
