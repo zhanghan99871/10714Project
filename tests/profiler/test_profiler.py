@@ -193,11 +193,11 @@ def test_peak_moves_between_phases():
 
     dev = ndl.cpu()
     np.random.seed(0)
-    m = LanguageModel(48, 100, 128, num_layers=LAYERS, seq_model="transformer", seq_len=96,
+    m = LanguageModel(48, 100, 128, num_layers=LAYERS, seq_model="transformer", seq_len=128,
                       device=dev, policies="fp32", half_softmax=True)
     rng = np.random.RandomState(1)
-    x = ndl.Tensor(rng.randint(0, 100, (96, 2)), device=dev, requires_grad=False)
-    y = ndl.Tensor(rng.randint(0, 100, 192), device=dev, requires_grad=False)
+    x = ndl.Tensor(rng.randint(0, 100, (128, 2)), device=dev, requires_grad=False)
+    y = ndl.Tensor(rng.randint(0, 100, 256), device=dev, requires_grad=False)
     loss_fn = lambda: nn.SoftmaxLoss()(m(x)[0], y)
     prof = profile_segments(m.sequence_model, loss_fn, params=m.parameters(), warmup=0, repeats=1)
     for third in ("fp32", "fp16", "none", "fp16_none"):
