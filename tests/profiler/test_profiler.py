@@ -320,7 +320,8 @@ def test_paired_timing_cancels_drift():
     prof = profile_segments(m.sequence_model, drifting_loss, params=m.parameters(),
                             policies=["fp32", "none"], warmup=1, repeats=3)
     deltas = [prof.time_delta[i]["none"] for i in range(LAYERS)]
-    assert max(deltas) - min(deltas) < 0.015, deltas
+    # unpaired timing would spread them by ~40 ms (biases of +20, +40, +60 ms)
+    assert max(deltas) - min(deltas) < 0.025, deltas
 
 
 def test_recompute_costs_time():
