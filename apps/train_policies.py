@@ -122,7 +122,7 @@ def main(argv=None):
     acc, loss = train_ptb(model, train, seq_len=cfg["seq_len"], n_epochs=args.epochs, optimizer=optimizer,
                           lr=args.lr, clip=args.clip, device=device, controller=controller, verbose=args.verbose)
     controller.results["train_seconds"] = time.perf_counter() - start
-    controller.results["train_loss"], controller.results["train_acc"] = float(loss), float(acc)
+    controller.results["train_loss"], controller.results["train_acc"] = float(loss), None if acc is None else float(acc)
 
     if controller.history:
         print(controller.summary())

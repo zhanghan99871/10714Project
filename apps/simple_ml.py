@@ -373,17 +373,17 @@ def epoch_general_ptb(data, model, seq_len=40, loss_fn=nn.SoftmaxLoss(), opt=Non
             num_tokens = y.shape[0]
             total_correct += np.sum(predictions == labels)
             
-            total_loss += loss.numpy().item() * num_tokens
-            total_samples += num_tokens
+        total_loss += loss.numpy().item() * num_tokens
+        total_samples += num_tokens
         del output, loss  # see epoch_general_cifar10
+        
+    avg_loss = total_loss / total_samples
 
     if verbose:
         avg_acc = total_correct / total_samples
-        avg_loss = total_loss / total_samples
-
         return avg_acc, avg_loss 
     else:
-        return None, None 
+        return None, avg_loss  
     ### END YOUR SOLUTION
 
 
