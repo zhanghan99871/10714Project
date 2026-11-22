@@ -1,5 +1,5 @@
 from typing import List, Optional, Sequence, Union
-from needle.autograd import Tensor, checkpoint
+from needle.autograd import Tensor, autocast_to, checkpoint
 from needle.amp import autocast
 import needle.backend_ndarray.ndarray as ndarray
 from needle import ops
@@ -32,9 +32,9 @@ class MultiHeadAttention(Module):
     ):
         """
         half_softmax: when the attention logits are float16 / bfloat16 (e.g. under
-            autocast), compute the softmax with the fused ops.softmax and keep its
-            output in that dtype, instead of the op-by-op softmax whose exp and sums
-            autocast runs in float32. Float32 logits always use the op-by-op softmax.
+            autocast), keep the softmax in that dtype; otherwise it is computed and
+            kept in float32, as autocast runs exp and sums. Either way it is the
+            fused ops.softmax (see softmax()).
         """
 
         super().__init__()
@@ -88,29 +88,22 @@ class MultiHeadAttention(Module):
 
     def softmax(self, logit):
         """
-        The softmax function; 
+        The softmax function over the last axis, as one fused op (ops.softmax):
+        computed in float32, only the output is kept for backward.
+
+        float32 logits give a float32 softmax. Half-precision logits give a
+        half-precision softmax with half_softmax, and otherwise (under autocast)
+        are cast to float32 first, as autocast does for exp and sum.
+
+        (The op-by-op softmax used before, exp(logit - max) / sum, made the
+        negated, broadcast max a full (batch, heads, T, T) constant: a leaf of the
+        graph, which gradient checkpointing cannot release, so every checkpointed
+        layer kept an attention-sized tensor besides its output. It also kept
+        logit - max, the exp and the quotient for backward.)
         """
-        if self.half_softmax and logit.dtype in ("float16", "bfloat16"):
-            # one op in the logits' dtype; the op-by-op version below is not safe
-            # in float16 (see ops.Softmax) and autocast would run it in float32
-            return ops.softmax(logit, axis=3)
-        max_val = Tensor(
-            logit.realize_cached_data().max(axis=3),
-            device=logit.device,
-            dtype=logit.dtype,
-            requires_grad=False
-        )
-
-        max_val = max_val.reshape((*logit.shape[:-1], 1))
-        max_val = max_val.broadcast_to(logit.shape)
-
-        probs = ops.exp(logit - max_val)
-
-        denom = probs.sum(axes=3)
-        denom = denom.reshape((*logit.shape[:-1], 1))
-        denom = denom.broadcast_to(logit.shape)
-
-        return probs / denom
+        if logit.dtype in ("float16", "bfloat16") and not self.half_softmax:
+            logit = autocast_to(logit, "float32")
+        return ops.softmax(logit, axis=3)
 
     def forward(
         self,

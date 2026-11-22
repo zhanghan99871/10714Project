@@ -294,11 +294,15 @@ def test_half_softmax_recorded(cpu_estimate):
     tr = m.sequence_model
     tr.half_softmax = True
     try:
-        hs = estimate_segment_errors(tr, fns, params=m.parameters(), gradients=False)
+        hs = estimate_segment_errors(tr, fns, params=m.parameters())
     finally:
         tr.half_softmax = False
     assert est.half_softmax is False and hs.half_softmax is True
-    assert hs.signed != est.signed  # a different float16 function
+    # the forward is the same either way: without half_softmax the float32 softmax
+    # is rounded to float16 by the next matmul's autocast cast, which is exactly the
+    # rounding of the fused float16 softmax; the backward (gradients) differs
+    assert hs.signed == est.signed
+    assert hs.grad_sq_batches != est.grad_sq_batches
 
 
 def test_argument_checks(cpu_estimate):
