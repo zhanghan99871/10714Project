@@ -412,3 +412,27 @@ def test_error_frontier_breaks_time_ties():
             if a is not b:
                 assert not (a.time <= b.time + 1e-12 and a.error <= b.error and
                             (a.time < b.time - 1e-12 or a.error < b.error)), (a.summary(), b.summary())
+
+
+def test_plan_policies_defaults_to_the_stats_files(capsys):
+    """Without --profile / --errors the script reads stats/prof_act_hs.json and
+    stats/err_act_hs.json (the committed GPU measurements; this also checks that
+    they still load and solve with the current code)."""
+    import os
+
+    sys.path.append(".")
+    from apps.plan_policies import DEFAULT_ERRORS, DEFAULT_PROFILE, main
+
+    if not (os.path.exists(DEFAULT_PROFILE) and os.path.exists(DEFAULT_ERRORS)):
+        pytest.skip("no stats files")
+    prof = SegmentProfile.load(DEFAULT_PROFILE)
+    plan = main(["--budget-fraction", "0.4", "--eps", "0.01"])
+    out = capsys.readouterr().out
+    assert f"errors: {DEFAULT_ERRORS}" in out and plan.feasible
+    assert plan.peak <= 0.4 * prof.predict_peak("fp32") and plan.error <= 0.01
+    plan = main(["--no-errors", "--budget-fraction", "0.4"])
+    assert plan.error is None and "errors: none" in capsys.readouterr().out
+    with pytest.raises(SystemExit):
+        main(["--no-errors", "--eps", "0.01"])  # an error limit needs the estimate
+    with pytest.raises(SystemExit):
+        main(["--profile", "stats/no_such_profile.json"])

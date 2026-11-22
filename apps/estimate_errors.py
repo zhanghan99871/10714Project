@@ -1,7 +1,7 @@
 """Estimate the per-segment float16 error of a Transformer LanguageModel and check it.
 
     python apps/estimate_errors.py                                  # cuda, "activations" size
-    python apps/estimate_errors.py --half-softmax --batches 8 --out err.json
+    python apps/estimate_errors.py --half-softmax --batches 8 --check 0 --out stats/err_act_hs.json
     python apps/estimate_errors.py --device cpu --layers 3 --embedding 64 --hidden 256 --batch 4 --seq-len 64
 
 Builds the model of apps/benchmark.py on random tokens, runs
@@ -13,6 +13,7 @@ a fraction of the batch noise (the standard deviation of the loss, and of the
 gradient, between batches).
 """
 import argparse
+import os
 import sys
 import time
 
@@ -45,7 +46,7 @@ def main():
     parser.add_argument("--check", type=int, default=12, help="random configurations to validate")
     parser.add_argument("--half-softmax", action="store_true")
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--out", help="save the estimate as JSON")
+    parser.add_argument("--out", help="save the estimate as JSON (e.g. stats/err_act_hs.json)")
     args = parser.parse_args()
 
     cfg = dict(SIZES[("transformer", args.size)])
@@ -75,6 +76,7 @@ def main():
     print(f"estimate: {time.perf_counter() - start:.2f} s for {args.batches} batches")
     print(est.summary())
     if args.out:
+        os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
         est.save(args.out)
         print(f"saved {args.out}")
 

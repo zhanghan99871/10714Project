@@ -1,7 +1,8 @@
 """Profile the segment policies of a Transformer LanguageModel and check the cost model.
 
     python apps/profile_segments.py                                  # cuda, "activations" size, tensor cores on
-    python apps/profile_segments.py --size long --check 12 --out prof.json
+    python apps/profile_segments.py --half-softmax --out stats/prof_act_hs.json
+    python apps/profile_segments.py --size long --check 12 --out stats/prof_long.json
     python apps/profile_segments.py --no-mma                         # fp16 matmuls without tensor cores
     python apps/profile_segments.py --half-softmax                   # attention softmax of fp16 segments in fp16
     python apps/profile_segments.py --device cpu --layers 3 --embedding 64 --hidden 256 --batch 8 --seq-len 32
@@ -13,6 +14,7 @@ with the predictions of the time and peak-memory models (the time model is fitte
 on single-segment switches only, so every multi-segment configuration is unseen).
 """
 import argparse
+import os
 import sys
 
 sys.path.append("./python")
@@ -68,7 +70,7 @@ def main():
     parser.add_argument("--check", type=int, default=8, help="random configurations to validate")
     parser.add_argument("--no-mma", action="store_true", help="profile with tensor cores off")
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--out", help="save the profile as JSON")
+    parser.add_argument("--out", help="save the profile as JSON (e.g. stats/prof_act_hs.json)")
     args = parser.parse_args()
 
     cfg, device, model, loss_fn = build(args)
@@ -83,6 +85,7 @@ def main():
                             warmup=args.warmup, repeats=args.repeats, mma=mma, key=key)
     print(prof.summary())
     if args.out:
+        os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
         prof.save(args.out)
         print(f"saved {args.out}")
 
