@@ -1,15 +1,16 @@
 """Estimate the per-segment float16 error of a Transformer LanguageModel and check it.
 
     python apps/estimate_errors.py                                  # cuda, "activations" size
-    python apps/estimate_errors.py --half-softmax --out err.json
+    python apps/estimate_errors.py --half-softmax --batches 8 --out err.json
     python apps/estimate_errors.py --device cpu --layers 3 --embedding 64 --hidden 256 --batch 4 --seq-len 64
 
 Builds the model of apps/benchmark.py on random tokens, runs
 needle.policy.estimate_segment_errors over --batches batches and prints the error
-table. It then measures, on the same batches, the actual loss error and relative
-gradient error of the uniform configurations and --check random ones, and compares
-them with the first-order predictions (predict(): the linear bound the optimizer
-uses; predict_signed(): |sum_i s_i|).
+table. It then measures, on the same batches, the actual RMS loss and gradient
+errors of configurations with float16 segments (the all-fp16 one and --check
+random ones) and compares them with the sum-of-squares predictions, everything as
+a fraction of the batch noise (the standard deviation of the loss, and of the
+gradient, between batches).
 """
 import argparse
 import sys
@@ -40,7 +41,7 @@ def main():
     parser.add_argument("--hidden", dest="hidden_size", type=int)
     parser.add_argument("--batch", type=int)
     parser.add_argument("--seq-len", dest="seq_len", type=int)
-    parser.add_argument("--batches", type=int, default=4, help="batches the estimate averages over")
+    parser.add_argument("--batches", type=int, default=8, help="batches the estimate and the noise use")
     parser.add_argument("--check", type=int, default=12, help="random configurations to validate")
     parser.add_argument("--half-softmax", action="store_true")
     parser.add_argument("--seed", type=int, default=0)
@@ -79,23 +80,24 @@ def main():
 
     n = est.num_segments
     rng = np.random.RandomState(args.seed + 2)
-    policies = est.policies
-    configs = [[p] * n for p in policies] + [list(rng.choice(policies, n)) for _ in range(args.check)]
+    configs = [["fp16"] * n] + [list(rng.choice(["fp32", "fp16"], n)) for _ in range(args.check)]
+    configs = [c for c in configs if "fp16" in c]
+    loss_sd, grad_sd = np.sqrt(est.noise("loss")), np.sqrt(est.noise("grad"))
     width = max(len(",".join(c)) for c in configs) + 1
-    print(f"\n{'policies':<{width}} {'bound':>9} {'1st-order':>9} {'measured':>9} {'grad err':>9}")
+    print(f"\nRMS error as a fraction of the batch noise (fp16_none = fp16, none = fp32: same errors)")
+    print(f"{'policies':<{width}} {'loss pred':>10} {'measured':>10}   {'grad pred':>10} {'measured':>10}")
     rows = []
     for config in configs:
         r = measure_precision_error(tr, fns, config, params=model.parameters())
-        bound, signed = est.predict(config), est.predict_signed(config)
-        rows.append((bound, signed, r["loss_error"], r["grad_error"]))
-        print(f"{','.join(config):<{width}} {bound:9.2e} {signed:9.2e} {r['loss_error']:9.2e} {r['grad_error']:9.2e}")
-    half = [r for r in rows if r[0] > 0]
-    if len(half) > 2:
-        b, s, a, g = (np.array(v) for v in zip(*half))
-        print(f"\nover the {len(half)} configurations with float16 segments: rank correlation of the bound "
-              f"with the measured loss error {rank_corr(b, a):.2f}, with the gradient error {rank_corr(b, g):.2f}; "
-              f"measured <= bound for {np.mean(a <= b):.0%} (largest measured / bound {np.max(a / b):.2f}); "
-              f"first-order |sum s_i| vs measured: median ratio {np.median(s / a):.2f}")
+        row = (est.predict(config, "loss"), r["loss_rms"] / loss_sd, est.predict(config, "grad"), r["grad_rms"] / grad_sd)
+        rows.append(row)
+        print(f"{','.join(config):<{width}} {row[0]:10.2e} {row[1]:10.2e}   {row[2]:10.2e} {row[3]:10.2e}")
+    pl, ml, pg, mg = (np.array(v) for v in zip(*rows))
+    for name, p, m in (("loss", pl, ml), ("gradient", pg, mg)):
+        ratio = m / p
+        corr = rank_corr(p, m) if len(p) > 2 else float("nan")
+        print(f"{name}: measured / predicted min {ratio.min():.2f}, median {np.median(ratio):.2f}, "
+              f"max {ratio.max():.2f}; rank correlation {corr:.2f}")
 
 
 if __name__ == "__main__":
