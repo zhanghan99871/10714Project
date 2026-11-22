@@ -86,6 +86,7 @@ def main(argv=None):
     parser.add_argument("--static", help="train with fixed policies (one, or one per segment, comma-separated)")
     parser.add_argument("--log", help="write the training log (JSON) here, e.g. stats/train_run.json")
     parser.add_argument("--no-eval", action="store_true", help="skip the final test evaluation")
+    parser.add_argument("--verbose", action="store_true", help="enable verbose output")
     args = parser.parse_args(argv)
 
     cfg = dict(SIZES[("transformer", args.size)])
@@ -119,7 +120,7 @@ def main(argv=None):
     optimizer = {"adam": ndl.optim.Adam, "sgd": ndl.optim.SGD}[args.optimizer]
     start = time.perf_counter()
     acc, loss = train_ptb(model, train, seq_len=cfg["seq_len"], n_epochs=args.epochs, optimizer=optimizer,
-                          lr=args.lr, clip=args.clip, device=device, controller=controller)
+                          lr=args.lr, clip=args.clip, device=device, controller=controller, verbose=args.verbose)
     controller.results["train_seconds"] = time.perf_counter() - start
     controller.results["train_loss"], controller.results["train_acc"] = float(loss), float(acc)
 
