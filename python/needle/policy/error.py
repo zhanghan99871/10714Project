@@ -296,7 +296,8 @@ def _sq_dist(a: List[np.ndarray], b: List[np.ndarray]) -> float:
 
 def estimate_segment_errors(transformer, loss_fn: LossFns, params: Optional[Iterable] = None,
                             reference: str = "none", gradients: bool = True,
-                            loss_scale: float = 1024.0, eval_mode: bool = True) -> SegmentErrors:
+                            loss_scale: float = 1024.0, eval_mode: bool = True,
+                            grad_batches: Optional[int] = None) -> SegmentErrors:
     """Precision errors of every half-precision policy on every segment of
     `transformer` (an nn.Transformer), and the batch noise; see the module docstring.
 
@@ -308,6 +309,10 @@ def estimate_segment_errors(transformer, loss_fn: LossFns, params: Optional[Iter
         embeddings); their .grad is restored afterwards.
     reference: the float32 policy of the reference steps ("none" or "fp32").
     gradients: also measure the gradient errors (n extra steps per batch).
+    grad_batches: measure the gradient errors on the first `grad_batches` batches
+        only (default: all); the batch noise and the loss errors still use every
+        batch. The gradient errors vary little between batches, so e.g. 2 of 8
+        batches cost 8 + 2n steps instead of 8 + 8n.
     loss_scale: initial loss scale of the steps with float16 segments (halved while
         their gradients overflow), as a GradScaler would apply.
     eval_mode: dropout off (needed whenever dropout > 0: every pass must compute
@@ -316,6 +321,8 @@ def estimate_segment_errors(transformer, loss_fn: LossFns, params: Optional[Iter
     if reference in HALF_PRECISION or reference not in SEGMENT_POLICIES:
         raise ValueError(f"the reference must be a float32 policy, got {reference!r}")
     fns = _as_list(loss_fn)
+    if grad_batches is not None and grad_batches < 1:
+        raise ValueError(f"grad_batches must be at least 1, got {grad_batches}")
     n = transformer.num_layers
     precisions = sorted(set(HALF_PRECISION.values()))
     params = list(transformer.parameters() if params is None else params)
@@ -324,7 +331,8 @@ def estimate_segment_errors(transformer, loss_fn: LossFns, params: Optional[Iter
     g_sum, g_sq = None, 0.0
     with _Preserved(transformer, params, eval_mode) as state:
         state.loss_scale = loss_scale
-        for fn in fns:
+        for b, fn in enumerate(fns):
+            measure_grads = gradients and (grad_batches is None or b < grad_batches)
             value, g_ref, xs, outs, out_grads = _reference_pass(transformer, fn, reference, params,
                                                                 state, state.loss_scale)
             losses.append(value)
@@ -338,7 +346,7 @@ def estimate_segment_errors(transformer, loss_fn: LossFns, params: Optional[Iter
                     s.append(float(np.sum(out_grads[i] * d)))
                     norm = float(np.linalg.norm(outs[i]))
                     pert[i][prec].append(float(np.linalg.norm(d)) / norm if norm > 0 else 0.0)
-                    if gradients:
+                    if measure_grads:
                         config = [reference] * n
                         config[i] = prec
                         _, g, _, state.loss_scale = _step(transformer, fn, config, params, state,
@@ -347,7 +355,8 @@ def estimate_segment_errors(transformer, loss_fn: LossFns, params: Optional[Iter
                 batch[prec] = s
                 batch_grad[prec] = gs
             signed.append(batch)
-            grad_sq.append(batch_grad)
+            if measure_grads:
+                grad_sq.append(batch_grad)
             del xs, outs, out_grads
     B = len(fns)
     loss_noise = float(np.var(losses, ddof=1)) if B > 1 else None

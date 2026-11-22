@@ -2,3 +2,4 @@
 from .profiler import SegmentProfile, profile_segments, measure_step, ProfileCache
 from .error import SegmentErrors, estimate_segment_errors, measure_precision_error
 from .solver import Plan, solve, memory_frontier, error_frontier
+from .controller import PolicyController, sample_ptb_batches, optimizer_state_bytes

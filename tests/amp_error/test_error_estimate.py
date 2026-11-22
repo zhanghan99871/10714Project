@@ -327,3 +327,18 @@ def test_save_load_round_trip(cpu_estimate, tmp_path):
         assert loaded.predict_signed(pol) == est.predict_signed(pol)
     text = est.summary()
     assert "segment 0" in text and "of noise" in text and "grad RMS" in text
+
+
+def test_grad_batches_limits_the_gradient_measurements(cpu_estimate):
+    """grad_batches=k measures the gradient errors on the first k batches only;
+    the loss errors and both noises still use every batch."""
+    m, fns, est = cpu_estimate
+    some = estimate_segment_errors(m.sequence_model, fns, params=m.parameters(), grad_batches=2)
+    assert len(some.grad_sq_batches) == 2 and len(some.signed) == len(fns) == 3
+    assert some.grad_sq_batches == est.grad_sq_batches[:2]
+    assert some.signed == est.signed and some.loss_noise == est.loss_noise
+    assert some.grad_noise == est.grad_noise
+    assert some.mean_sq("grad")[0]["fp16"] == pytest.approx(
+        np.mean([b["fp16"][0] for b in est.grad_sq_batches[:2]]))
+    with pytest.raises(ValueError, match="grad_batches"):
+        estimate_segment_errors(m.sequence_model, fns, params=m.parameters(), grad_batches=0)
