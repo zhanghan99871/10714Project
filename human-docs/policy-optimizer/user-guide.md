@@ -1,8 +1,8 @@
 # Policy optimizer: user guide
 
-Date: 2026-11-22. Branch: `solver`. Status: profiler, error estimator and solver are done. The training controller (re-planning every k epochs during training) is not written yet.
+Date: 2026-11-22. Branch: `dynamic_training`. Status: profiler, error estimator, solver and training controller are done. A check of the real GPU memory is planned ([section 12](#12-limitations)).
 
-This guide explains how to choose a precision and checkpoint policy for every layer of a needle Transformer. You profile the model once, estimate the precision errors, and then ask the solver for the fastest plan that fits a memory budget and an error limit.
+This guide explains how to choose a precision and checkpoint policy for every layer of a needle Transformer. You profile the model once, estimate the precision errors, and then ask the solver for the fastest plan that fits a memory budget and an error limit. During training, the controller repeats the error estimate and the plan every k epochs.
 
 ## Contents
 
@@ -12,12 +12,13 @@ This guide explains how to choose a precision and checkpoint policy for every la
 4. [Step 2: estimate the precision errors](#4-step-2-estimate-the-precision-errors)
 5. [Step 3: plan](#5-step-3-plan)
 6. [Use a plan in training](#6-use-a-plan-in-training)
-7. [The Python API](#7-the-python-api)
-8. [The stats folder](#8-the-stats-folder)
-9. [How accurate the models are](#9-how-accurate-the-models-are)
-10. [Troubleshooting](#10-troubleshooting)
-11. [Limitations](#11-limitations)
-12. [Where the code is](#12-where-the-code-is)
+7. [Train with the controller](#7-train-with-the-controller)
+8. [The Python API](#8-the-python-api)
+9. [The stats folder](#9-the-stats-folder)
+10. [How accurate the models are](#10-how-accurate-the-models-are)
+11. [Troubleshooting](#11-troubleshooting)
+12. [Limitations](#12-limitations)
+13. [Where the code is](#13-where-the-code-is)
 
 ## 1. What the optimizer does
 
@@ -32,13 +33,14 @@ A **segment** is one `TransformerLayer`. Each segment runs under one **policy**:
 
 One more model option changes the costs: `half_softmax=True` runs the attention softmax of float16 segments in float16 (a fused, overflow-safe op). Without it, autocast runs the softmax in float32, and float16 segments save much less memory.
 
-The optimizer has three parts. Each part makes a table of costs per segment and policy:
+The optimizer has four parts. The first two make a table of costs per segment and policy, the third plans from them, and the fourth repeats this during training:
 
 | Part | Script | Measures | Model |
 |---|---|---|---|
 | Profiler | `apps/profile_segments.py` | step time, peak memory | time = base + sum of per-segment changes; peak = the highest of the step's phases |
 | Error estimator | `apps/estimate_errors.py` | precision error | sum of squares of per-segment errors, relative to the batch noise |
 | Solver | `apps/plan_policies.py` | nothing (it reads the two tables) | mixed-integer linear program (MILP) |
+| Controller | `apps/train_policies.py` | the errors again every k epochs, the real peak of every epoch | profile once, then estimate, solve and apply every k epochs |
 
 The solver picks one policy per segment. It minimizes the step time, subject to two limits:
 
@@ -249,7 +251,7 @@ fp32,none,none,none                    558.62     2922.5  0.000e+00
 | `--budget-fraction F` | budget as a fraction of the all-`fp32` predicted peak |
 | `--budget-mib M` | budget in MiB for the whole step, static memory included |
 | `--eps E` | allowed RMS gradient error as a fraction of the batch noise; `0` allows only `fp32` and `none` |
-| `--metric grad\|loss` | the error to limit (default `grad`; see [section 9](#9-how-accurate-the-models-are)) |
+| `--metric grad\|loss` | the error to limit (default `grad`; see [section 10](#10-how-accurate-the-models-are)) |
 | `--memory-margin 0.1` | use 90% of the budget |
 | `--error-margin 1.2` | use eps / 1.2 |
 | `--policies fp32,none,fp16_none` | choose only from these policies |
@@ -260,7 +262,7 @@ Without a budget and without `--eps`, the plan is the fastest configuration (her
 
 ### Choosing the budget and eps
 
-- **Budget:** start with `--budget-fraction` between 0.3 and 0.7. The budget counts only needle's own arrays (see [section 11](#11-limitations)). Until the real GPU memory is checked, keep a margin, for example `--memory-margin 0.1`.
+- **Budget:** start with `--budget-fraction` between 0.3 and 0.7. The budget counts only needle's own arrays (see [section 12](#12-limitations)). Until the real GPU memory is checked, keep a margin, for example `--memory-margin 0.1`.
 - **eps:** with the current estimate, all segments in float16 give 0.018. Thus, any `eps` above 0.018 allows everything, and only the budget and the time decide. The interesting range is about 0.005 to 0.018.
 
 ## 6. Use a plan in training
@@ -286,9 +288,134 @@ for x, y in batches:
 
 Do not wrap the model in an outer `ndl.autocast()`. Each segment sets its own precision, and the profile was measured without an outer region (it would also change the embedding and the output layer).
 
-You can call `set_policies` between steps at any time, because every step builds a new graph. The planned training controller will do this automatically every k epochs.
+You can call `set_policies` between steps at any time, because every step builds a new graph. The controller ([section 7](#7-train-with-the-controller)) does this automatically every k epochs.
 
-## 7. The Python API
+## 7. Train with the controller
+
+The controller updates the plan during training. At epoch 0, and then every k epochs, it:
+
+1. **profiles** the model on a training batch, once per batch shape (or uses a saved profile);
+2. **estimates the precision errors** on a few training batches. The errors change while the model trains, so this is the reason to plan again;
+3. **solves** for the fastest plan within the memory budget and `eps`;
+4. **applies** the plan with `set_policies`.
+
+### From the command line
+
+`apps/train_policies.py` trains the `LanguageModel` of the benchmark sizes with `apps/simple_ml.train_ptb` and a controller:
+
+```bash
+python apps/train_policies.py --data data/ptb --half-softmax --budget-fraction 0.4 --eps 0.01 \
+    --replan-every 5 --epochs 20 --log stats/train_ptb_b40_e01.json
+```
+
+- `--data data/ptb` is a folder with `train.txt` and `test.txt` (Penn Treebank, from the homework). The `data/` folder is not in the repository. `--data random` uses random tokens with a vocabulary of 1000 words, for a quick check.
+- The controller profiles the model at epoch 0. `--profile FILE` uses a saved profile instead, which saves a few minutes. **The profile must come from the same model**: the same sizes, the same vocabulary, the same batch shape and the same `--half-softmax`. The controller checks the batch shape, but it cannot check the vocabulary. Thus, `stats/prof_act_hs.json` (random tokens, vocabulary 1000) does not fit PTB (vocabulary about 10,000): its embedding and output layer are smaller. Use it only with `--data random`, or save a profile of the PTB model first.
+- At the end, the script evaluates the model on `test.txt` and prints the test loss and perplexity.
+
+Baselines with fixed policies use the same log format. Nothing is profiled or planned:
+
+```bash
+python apps/train_policies.py --data data/ptb --half-softmax --static fp16 --epochs 20 --log stats/train_ptb_fp16.json
+```
+
+A quick check without data, on the CPU:
+
+```bash
+python apps/train_policies.py --data random --device cpu --layers 3 --embedding 64 --hidden 256 --batch 4 \
+    --seq-len 32 --random-steps 8 --epochs 4 --budget-fraction 0.7 --eps 0.01 --replan-every 2 --error-batches 4
+```
+
+```
+epoch 0 (schedule): fp32,none,none | predicted 114.5 ms/step, peak 23.9 MiB, error 0.000e+00 | profile 10.2 s, errors 1.5 s, solve 0.21 s
+epoch 2 (schedule): fp32,none,none | predicted 114.5 ms/step, peak 23.9 MiB, error 0.000e+00 | profile 0.0 s, errors 1.5 s, solve 0.03 s
+
+epoch policies                                       loss   time s  peak MiB  pred MiB
+    0 fp32,none,none                              14.9795      1.2      23.9      23.9
+    1 fp32,none,none                              10.1256      1.1      23.9      23.9
+```
+
+- The first lines are the re-plans: the epoch and the reason (`schedule` or `over budget`), the plan, its predictions and the time spent. `profile 0.0 s` means that the profile came from the cache.
+- The table has one line per epoch. `peak MiB` is the measured peak of the epoch, and `pred MiB` is the plan's prediction.
+
+Options (the model and data options are as in step 1):
+
+| Option | Meaning |
+|---|---|
+| `--data DIR\|random`, `--max-lines N`, `--random-steps N` | the training data |
+| `--epochs`, `--optimizer adam\|sgd`, `--lr`, `--clip`, `--seed` | the training |
+| `--budget-fraction F` / `--budget-mib M` | memory budget (as in step 3; the optimizer state is included) |
+| `--eps E`, `--metric grad\|loss` | error limit |
+| `--replan-every K` | plan again at epochs 0, K, 2K, ... (default 5) |
+| `--error-batches 8`, `--grad-batches 2` | batches for the error estimate, and how many of them measure gradient errors |
+| `--memory-margin`, `--error-margin`, `--policies` | as in step 3 |
+| `--profile FILE` | use a saved profile of the same model, vocabulary and batch shape |
+| `--static P` | fixed policies (one, or one per segment, comma-separated) |
+| `--log FILE` | the training log (JSON) |
+| `--no-eval` | skip the test evaluation |
+
+### In Python
+
+```python
+import needle as ndl
+from apps.simple_ml import train_ptb
+from needle.policy import PolicyController
+
+controller = PolicyController(model, budget_fraction=0.4, eps=0.01, replan_every=5,
+                              log_path="stats/train_run.json")   # profile=SegmentProfile.load(...) to skip profiling
+train_ptb(model, train_data, seq_len=256, n_epochs=20, optimizer=ndl.optim.Adam, lr=1e-3,
+          controller=controller)
+print(controller.summary())
+```
+
+`train_ptb` gives the controller its optimizer (for the memory budget), uses the controller's `GradScaler`, and records every epoch. Do not pass `amp` together with a controller: the controller sets the precision of every segment.
+
+In a training loop of your own:
+
+```python
+from needle.policy import sample_ptb_batches
+
+opt = ndl.optim.Adam(model.parameters(), lr=1e-3)
+controller = PolicyController(model, budget_fraction=0.4, eps=0.01, replan_every=5, optimizer=opt)
+for epoch in range(n_epochs):
+    controller.before_epoch(epoch, lambda: sample_ptb_batches(train_data, seq_len, controller.error_batches))
+    ...  # train one epoch; use controller.scaler as the GradScaler
+    controller.after_epoch(epoch, loss=avg_loss, seconds=elapsed, peak=peak_bytes, steps=n_steps)
+```
+
+`sample_ptb_batches` takes full-length batches, evenly spaced over the epoch. `peak_bytes` is `needle.backend_ndarray.max_memory_allocated(device)` after `reset_peak_memory_stats(device)` at the start of the epoch.
+
+### How the memory budget is kept
+
+- **The optimizer state is counted.** Adam keeps two copies of the parameters, and needle's SGD keeps one. A profile made before training does not contain this state, so the controller adds it.
+- **Memory outside the profile is learned.** The profile covers the loss and the backward. The training loop holds more: the optimizer step runs while the step's graph is still alive, and it makes temporaries. The controller compares the measured peak of each epoch with the prediction. It adds the largest excess at the next re-plan, so the prediction then covers the measurement.
+- **An epoch over the budget re-plans early.** If a feasible plan goes over the budget, the next epoch plans again, with the reason `over budget`. An infeasible plan does not cause this, because it is already the configuration with the lowest peak.
+
+Thus, the first epochs can exceed the budget by the memory that the profile does not see. At the `activations` size this memory is small (the parameters are about 14 MiB, the activations are gigabytes).
+
+### What a re-plan costs
+
+| Part | Cost |
+|---|---|
+| profile | once per batch shape: a few minutes at the `activations` size (0 s with `--profile`) |
+| errors | `error_batches` reference steps + `grad_batches` x n gradient steps: 8 + 2 x 4 = 16 steps for 4 layers |
+| solve | less than a second |
+
+A PTB epoch at the `activations` size has about 110 steps. Thus, re-planning every epoch costs about 15% more time, and every 5 epochs about 3%. The gradient errors vary little between batches (about ±7%), so 2 gradient batches are enough. The batch noise needs more batches; 8 give it to about ±25%.
+
+Re-planning does not change the training itself. The controller restores the random state, the gradients and the training mode. A test checks that a run with a re-plan in every epoch gives exactly the same parameters as a run with the same policies set by hand.
+
+### The training log
+
+The log (`--log`, or `log_path=`) is written after every re-plan and every epoch:
+
+| Part | Fields |
+|---|---|
+| `config` | the controller settings, the number of segments, `half_softmax`, the optimizer |
+| `replans` | per re-plan: `epoch`, `reason`, `policies`, `feasible`, `predicted_time`, `predicted_peak`, `predicted_error`, `limited_by`, `budget`, `eps`, `optimizer_state`, `unmodeled`, `profiled`, `seconds` (profile, errors, solve), `segment_errors` (per segment, as a fraction of the noise), `noise`, `mean_loss` |
+| `epochs` | per epoch: `policies`, `loss`, `acc`, `seconds`, `steps`, `measured_peak`, `predicted_peak`, `predicted_step_time`, `over_budget`, `loss_scale`, `skipped_steps` |
+| `results` | the model and training configuration, `train_seconds`, `train_loss`, and `test_loss` and `test_perplexity` |
+
+## 8. The Python API
 
 All functions are in `needle.policy`.
 
@@ -324,12 +451,16 @@ Useful methods:
 | `error_frontier(prof, errs, budget=...)` | a list of plans (time against error) |
 | `measure_step(tr, loss_fn, policies, ...)` | the measured time and peak of complete steps |
 | `measure_precision_error(tr, loss_fns, policies, ...)` | the measured loss and gradient errors |
+| `estimate_segment_errors(..., grad_batches=2)` | gradient errors from the first 2 batches only (the noise still uses all of them) |
+| `PolicyController(model, budget=..., eps=..., replan_every=k, ...)` | the controller ([section 7](#7-train-with-the-controller)): `before_epoch`, `after_epoch`, `replan`, `scaler`, `plan`, `history`, `epochs`, `summary()`, `save_log()` |
+| `sample_ptb_batches(data, seq_len, n)` | n full-length (x, y) batches of batchified data |
+| `optimizer_state_bytes(opt)` | the bytes of an optimizer's state after its first step |
 
 `policies` is a list with one policy per segment, or one string for all segments.
 
 The profiler and the estimator restore everything they change: the policies, the segment hook, the training mode and the `.grad` of `params`. Pass `params=model.parameters()`, so that the embedding and the output layer are included.
 
-## 8. The stats folder
+## 9. The stats folder
 
 `stats/` keeps the measured tables, so that you can plan without the GPU:
 
@@ -353,7 +484,7 @@ Both files are plain JSON. Important fields:
 
 Profiles from before the phase model (branch `profiler`, first version) still load. They predict the peak with the older, less exact additive model.
 
-## 9. How accurate the models are
+## 10. How accurate the models are
 
 Measured on the GPU (`activations` size, tensor cores on):
 
@@ -369,7 +500,7 @@ Thus:
 - **Limit the gradient error** (the default). An `--error-margin` of 1.0 to 1.1 is enough at this size. On very small models, the gradient model under-predicted by up to 1.3 times.
 - **The loss error is less reliable.** It is one number per batch, and the errors of different segments are correlated. If you limit it, use `--error-margin 2`.
 
-## 10. Troubleshooting
+## 11. Troubleshooting
 
 | Message | Cause and fix |
 |---|---|
@@ -381,16 +512,21 @@ Thus:
 | `INFEASIBLE plan` | No configuration fits. Raise the budget or `eps`, or allow more policies. The printed plan is the one with the lowest peak. |
 | `no gradient reached the output of segment(s) ...` | The loss does not depend on those segments, or the parameters do not require grad. |
 | the CPU times look random | CPU timings are noisy, and float16 is slow on the CPU. Profile on the GPU. |
+| `amp and a policy controller are exclusive` | Do not pass `amp` to `train_ptb` with a controller. The controller sets the precision of every segment. |
+| `an error limit needs at least 2 error_batches` | The batch noise needs two batches or more. |
+| `the model's sequence_model (or the model) must be an nn.Transformer` | The controller works with Transformer models (`seq_model="transformer"`). |
+| many re-plans with the reason `over budget` | The epochs need more memory than the profile predicts. After each such re-plan the controller knows more of it. If it continues, use a `--memory-margin`. |
+| `INFEASIBLE` in every re-plan | No configuration fits the budget. The model trains with the configuration with the lowest peak. |
 
-## 11. Limitations
+## 12. Limitations
 
 - **The budget counts only needle's arrays** (`needle.backend_ndarray.max_memory_allocated`). The real GPU memory (`nvidia-smi`) is higher because of the CUDA context and fragmentation. A check with `cudaMemGetInfo` is planned. Until then, use a memory margin.
-- **The tables come from random tokens.** The time and the memory do not depend on the data. The errors and the batch noise do. With real data, and later in training, the noise is usually larger relative to the gradient, so the same float16 errors are relatively smaller. Estimate the errors again during training (the planned controller does this).
-- **The profile is for one batch shape.** For other shapes, profile again (`needle.policy.ProfileCache` keeps one profile per shape).
+- **The saved tables in `stats/` come from random tokens.** The time and the memory do not depend on the data. The errors and the batch noise do. With real data, and later in training, the noise is usually larger relative to the gradient, so the same float16 errors are relatively smaller. The controller estimates the errors again on the training data.
+- **The profile is for one batch shape.** For other shapes, profile again (`needle.policy.ProfileCache` keeps one profile per shape). In training, the last batch of an epoch can be shorter; it runs with the plan of the full batches, which needs more memory and time than it.
+- **The first epochs can exceed the budget a little.** The controller learns the memory outside the profile from the measured epochs ([section 7](#7-train-with-the-controller)).
 - **Policies are only float16 for now.** bfloat16 policies are possible later.
-- **The training controller is not written yet.** You set the plan by hand (see [section 6](#6-use-a-plan-in-training)).
 
-## 12. Where the code is
+## 13. Where the code is
 
 | File | Contents |
 |---|---|
@@ -398,5 +534,7 @@ Thus:
 | [python/needle/policy/profiler.py](../../python/needle/policy/profiler.py) | `profile_segments`, `measure_step`, `SegmentProfile`, `ProfileCache` |
 | [python/needle/policy/error.py](../../python/needle/policy/error.py) | `estimate_segment_errors`, `measure_precision_error`, `SegmentErrors` |
 | [python/needle/policy/solver.py](../../python/needle/policy/solver.py) | `solve`, `memory_frontier`, `error_frontier`, `Plan` |
-| [apps/profile_segments.py](../../apps/profile_segments.py), [apps/estimate_errors.py](../../apps/estimate_errors.py), [apps/plan_policies.py](../../apps/plan_policies.py) | the three scripts |
-| [tests/profiler](../../tests/profiler), [tests/amp_error](../../tests/amp_error), [tests/solver](../../tests/solver), [tests/policy](../../tests/policy) | the tests |
+| [python/needle/policy/controller.py](../../python/needle/policy/controller.py) | `PolicyController`, `sample_ptb_batches`, `optimizer_state_bytes` |
+| [apps/simple_ml.py](../../apps/simple_ml.py) | `train_ptb(..., controller=)` |
+| [apps/profile_segments.py](../../apps/profile_segments.py), [apps/estimate_errors.py](../../apps/estimate_errors.py), [apps/plan_policies.py](../../apps/plan_policies.py), [apps/train_policies.py](../../apps/train_policies.py) | the four scripts |
+| [tests/profiler](../../tests/profiler), [tests/amp_error](../../tests/amp_error), [tests/solver](../../tests/solver), [tests/controller](../../tests/controller), [tests/policy](../../tests/policy) | the tests |

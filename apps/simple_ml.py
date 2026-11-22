@@ -14,6 +14,7 @@ from apps.models import *
 import time
 import contextlib
 device = ndl.cpu()
+import tqdm 
 
 def parse_mnist(image_filename, label_filename):
     """Read an images and labels file in MNIST format.  See this page:
@@ -352,7 +353,7 @@ def epoch_general_ptb(data, model, seq_len=40, loss_fn=nn.SoftmaxLoss(), opt=Non
         device = model.parameters()[0].device
     h = None 
     scaler = _make_scaler(amp, opt, scaler)
-    for i in range(0, data.shape[0] - 1, seq_len):
+    for i in tqdm.tqdm(range(0, data.shape[0] - 1, seq_len)):
         X, y = get_batch(data, i, seq_len, device=device, dtype=dtype)
         with _grad_context(opt), _amp_context(amp):
             output, h = model(X, h) 
@@ -383,7 +384,7 @@ def epoch_general_ptb(data, model, seq_len=40, loss_fn=nn.SoftmaxLoss(), opt=Non
 
 def train_ptb(model, data, seq_len=40, n_epochs=1, optimizer=ndl.optim.SGD,
           lr=4.0, weight_decay=0.0, loss_fn=nn.SoftmaxLoss, clip=None,
-          device=None, dtype="float32", amp=False, scaler=None):
+          device=None, dtype="float32", amp=False, scaler=None, controller=None):
     """
     Performs {n_epochs} epochs of training.
 
@@ -402,6 +403,12 @@ def train_ptb(model, data, seq_len=40, n_epochs=1, optimizer=ndl.optim.SGD,
         scaler: GradScaler to use with amp (default: GradScaler() with
             init_scale 2**16; its first steps may be skipped while the scale
             backs off to a value at which the float16 gradients do not overflow)
+        controller: a needle.policy.PolicyController (transformer models): it
+            chooses the segment policies before epoch 0 and every
+            controller.replan_every epochs, on controller.error_batches batches of
+            `data`, and records every epoch (loss, time, steps, measured peak).
+            Its GradScaler is used; not together with amp (the controller sets
+            the precision of every segment).
 
     Returns:
         avg_acc: average accuracy over dataset from last epoch of training
@@ -412,11 +419,30 @@ def train_ptb(model, data, seq_len=40, n_epochs=1, optimizer=ndl.optim.SGD,
     # raise NotImplementedError()
     opt = optimizer(model.parameters(), lr=lr, weight_decay=weight_decay) 
     criterion = loss_fn()
+    if controller is not None:
+        if _amp_dtype(amp) is not None:
+            raise ValueError("amp and a policy controller are exclusive: the controller sets the "
+                             "precision of every segment")
+        if controller.optimizer is None:
+            controller.optimizer = opt  # its state counts in the memory budget
+        scaler = controller.scaler
     if scaler is None:
         scaler = ndl.amp.GradScaler(enabled=_amp_dtype(amp) == "float16")
-    for i in range(n_epochs):
+    if controller is not None and device is None:
+        device = model.parameters()[0].device
+    for i in tqdm.tqdm(range(n_epochs)):
+        if controller is not None:
+            from needle.policy import sample_ptb_batches
+            controller.before_epoch(i, lambda: sample_ptb_batches(
+                data, seq_len, controller.error_batches, device=device, dtype=dtype))
+            ndl.backend_ndarray.reset_peak_memory_stats(device)
+            start = time.perf_counter()
         acc, loss = epoch_general_ptb(data, model, seq_len, criterion, opt, clip, device, dtype,
                                       amp=amp, scaler=scaler)
+        if controller is not None:
+            controller.after_epoch(i, loss=loss, acc=acc, seconds=time.perf_counter() - start,
+                                   peak=ndl.backend_ndarray.max_memory_allocated(device),
+                                   steps=len(range(0, data.shape[0] - 1, seq_len)))
     return acc, loss
     ### END YOUR SOLUTION
 
