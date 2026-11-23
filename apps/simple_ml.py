@@ -370,9 +370,9 @@ def epoch_general_ptb(data, model, seq_len=40, loss_fn=nn.SoftmaxLoss(), opt=Non
             labels = y.numpy()
 
             predictions = np.argmax(logits, axis=1)
-            num_tokens = y.shape[0]
             total_correct += np.sum(predictions == labels)
             
+        num_tokens = y.shape[0]
         total_loss += loss.numpy().item() * num_tokens
         total_samples += num_tokens
         del output, loss  # see epoch_general_cifar10
