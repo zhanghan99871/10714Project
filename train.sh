@@ -44,7 +44,7 @@ OPTIMIZER=${OPTIMIZER:-adam}
 LR=${LR:-0.001}
 SEED=${SEED:-0}
 OUT=${OUT:-stats/experiments}
-BUDGET=${BUDGET:-0.55}
+BUDGET=${BUDGET:-0.6}
 EPS=${EPS:-0.01}
 EPS_LOSS=${EPS_LOSS:-0.0008}
 K=${K:-5}
@@ -107,7 +107,7 @@ baseline() {
 
 lp_runs() {
   # memory budget sweep at the reference error limit
-  for b in 0.7 "$BUDGET" 0.45; do
+  for b in 0.8 "$BUDGET" 0.4; do
     lp "lp_b$(pct "$b")_e$EPS" --budget-fraction "$b" --eps "$EPS"
   done
   # error limit sweep at the reference budget
@@ -115,7 +115,6 @@ lp_runs() {
     lp "lp_b$(pct "$BUDGET")_e$e" --budget-fraction "$BUDGET" --eps "$e"
   done
   lp "lp_b$(pct "$BUDGET")_noeps" --budget-fraction "$BUDGET"  # memory only: no error limit
-  lp "lp_b35_noeps" --budget-fraction 0.35                     # a budget only fp16_none reaches
   lp "lp_nobudget_e$EPS" --eps "$EPS"                          # error only: the fastest within eps
 }
 
@@ -129,14 +128,6 @@ ablation() {
   # smaller policy sets: precision only, checkpointing only, without fp16_none
   lp abl_precision_only     "${ref[@]}" --policies fp32,fp16
   lp abl_checkpoint_only    --budget-fraction "$BUDGET" --policies fp32,none
-  lp abl_without_fp16_none  "${ref[@]}" --policies fp32,fp16,none
-  # the error estimate's gradient term on all 8 batches instead of 2 (cost vs plan)
-  lp abl_grad_batches8      "${ref[@]}" --grad-batches 8
-  # attention softmax of float16 layers in float32 (its own profile: different costs)
-  local profile=(--save-profile "$PROFILE_NOHS")
-  [[ -f "$PROFILE_NOHS" ]] && profile=(--profile "$PROFILE_NOHS")
-  run abl_no_half_softmax "${ref[@]}" --replan-every "$K" "${profile[@]}"
-  run abl_fp16_no_half_softmax --static fp16
 }
 
 summary() {
