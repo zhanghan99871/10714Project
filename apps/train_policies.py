@@ -24,6 +24,7 @@ loss and perplexity. See human-docs/policy-optimizer/user-guide.md.
 """
 import argparse
 import math
+import os
 import sys
 import time
 
@@ -83,6 +84,8 @@ def main(argv=None):
     parser.add_argument("--error-margin", type=float, default=1.0)
     parser.add_argument("--policies", help="comma-separated policies to choose from")
     parser.add_argument("--profile", help="use this saved profile instead of profiling")
+    parser.add_argument("--save-profile", help="save the profile made at epoch 0 here (JSON), for --profile in "
+                                               "later runs of the same model, vocabulary and batch shape")
     parser.add_argument("--static", help="train with fixed policies (one, or one per segment, comma-separated)")
     parser.add_argument("--log", help="write the training log (JSON) here, e.g. stats/train_run.json")
     parser.add_argument("--no-eval", action="store_true", help="skip the final test evaluation")
@@ -137,6 +140,10 @@ def main(argv=None):
                                   test_perplexity=float(math.exp(test_loss)))
         print(f"test loss {test_loss:.4f}, perplexity {math.exp(test_loss):.2f}")
     controller.save_log()
+    if args.save_profile and controller.profile is not None:
+        os.makedirs(os.path.dirname(args.save_profile) or ".", exist_ok=True)
+        controller.profile.save(args.save_profile)
+        print(f"profile: {args.save_profile}")
     if args.log:
         print(f"log: {args.log}")
     return controller
