@@ -1,0 +1,237 @@
+{
+ "config": {
+  "budget": null,
+  "budget_fraction": null,
+  "eps": null,
+  "metric": "grad",
+  "replan_every": 5,
+  "error_batches": 8,
+  "grad_batches": 2,
+  "memory_margin": 0.0,
+  "error_margin": 1.0,
+  "policies": null,
+  "static_policies": [
+   "fp32",
+   "fp32",
+   "fp32",
+   "fp32"
+  ],
+  "num_segments": 4,
+  "half_softmax": true,
+  "optimizer": "Adam"
+ },
+ "replans": [],
+ "epochs": [
+  {
+   "epoch": 0,
+   "policies": [
+    "fp32",
+    "fp32",
+    "fp32",
+    "fp32"
+   ],
+   "loss": 9.388226569765889,
+   "acc": null,
+   "seconds": 120.8967202939998,
+   "steps": 114,
+   "measured_peak": 9958531344,
+   "predicted_peak": null,
+   "predicted_step_time": null,
+   "over_budget": false,
+   "loss_scale": 1.0,
+   "skipped_steps": 0
+  },
+  {
+   "epoch": 1,
+   "policies": [
+    "fp32",
+    "fp32",
+    "fp32",
+    "fp32"
+   ],
+   "loss": 6.374276995757367,
+   "acc": null,
+   "seconds": 121.66725316300017,
+   "steps": 114,
+   "measured_peak": 9958531344,
+   "predicted_peak": null,
+   "predicted_step_time": null,
+   "over_budget": false,
+   "loss_scale": 1.0,
+   "skipped_steps": 0
+  },
+  {
+   "epoch": 2,
+   "policies": [
+    "fp32",
+    "fp32",
+    "fp32",
+    "fp32"
+   ],
+   "loss": 5.963040744000905,
+   "acc": null,
+   "seconds": 124.23701368000002,
+   "steps": 114,
+   "measured_peak": 9958531344,
+   "predicted_peak": null,
+   "predicted_step_time": null,
+   "over_budget": false,
+   "loss_scale": 1.0,
+   "skipped_steps": 0
+  },
+  {
+   "epoch": 3,
+   "policies": [
+    "fp32",
+    "fp32",
+    "fp32",
+    "fp32"
+   ],
+   "loss": 5.693046079329373,
+   "acc": null,
+   "seconds": 126.59551747500018,
+   "steps": 114,
+   "measured_peak": 9958531344,
+   "predicted_peak": null,
+   "predicted_step_time": null,
+   "over_budget": false,
+   "loss_scale": 1.0,
+   "skipped_steps": 0
+  },
+  {
+   "epoch": 4,
+   "policies": [
+    "fp32",
+    "fp32",
+    "fp32",
+    "fp32"
+   ],
+   "loss": 5.504849756036505,
+   "acc": null,
+   "seconds": 127.04183341600037,
+   "steps": 114,
+   "measured_peak": 9958531344,
+   "predicted_peak": null,
+   "predicted_step_time": null,
+   "over_budget": false,
+   "loss_scale": 1.0,
+   "skipped_steps": 0
+  },
+  {
+   "epoch": 5,
+   "policies": [
+    "fp32",
+    "fp32",
+    "fp32",
+    "fp32"
+   ],
+   "loss": 5.349073888447225,
+   "acc": null,
+   "seconds": 126.61929353999994,
+   "steps": 114,
+   "measured_peak": 9958531344,
+   "predicted_peak": null,
+   "predicted_step_time": null,
+   "over_budget": false,
+   "loss_scale": 1.0,
+   "skipped_steps": 0
+  },
+  {
+   "epoch": 6,
+   "policies": [
+    "fp32",
+    "fp32",
+    "fp32",
+    "fp32"
+   ],
+   "loss": 5.204193963324259,
+   "acc": null,
+   "seconds": 122.36541694600055,
+   "steps": 114,
+   "measured_peak": 9958531344,
+   "predicted_peak": null,
+   "predicted_step_time": null,
+   "over_budget": false,
+   "loss_scale": 1.0,
+   "skipped_steps": 0
+  },
+  {
+   "epoch": 7,
+   "policies": [
+    "fp32",
+    "fp32",
+    "fp32",
+    "fp32"
+   ],
+   "loss": 5.068693811064152,
+   "acc": null,
+   "seconds": 121.64046853199943,
+   "steps": 114,
+   "measured_peak": 9958531344,
+   "predicted_peak": null,
+   "predicted_step_time": null,
+   "over_budget": false,
+   "loss_scale": 1.0,
+   "skipped_steps": 0
+  },
+  {
+   "epoch": 8,
+   "policies": [
+    "fp32",
+    "fp32",
+    "fp32",
+    "fp32"
+   ],
+   "loss": 4.943253261200557,
+   "acc": null,
+   "seconds": 122.31940898799985,
+   "steps": 114,
+   "measured_peak": 9958531344,
+   "predicted_peak": null,
+   "predicted_step_time": null,
+   "over_budget": false,
+   "loss_scale": 1.0,
+   "skipped_steps": 0
+  },
+  {
+   "epoch": 9,
+   "policies": [
+    "fp32",
+    "fp32",
+    "fp32",
+    "fp32"
+   ],
+   "loss": 4.81167327737191,
+   "acc": null,
+   "seconds": 122.50343166400035,
+   "steps": 114,
+   "measured_peak": 9958531344,
+   "predicted_peak": null,
+   "predicted_step_time": null,
+   "over_budget": false,
+   "loss_scale": 1.0,
+   "skipped_steps": 0
+  }
+ ],
+ "results": {
+  "config": {
+   "embedding_size": 256,
+   "hidden_size": 1024,
+   "num_layers": 4,
+   "batch": 32,
+   "seq_len": 256,
+   "vocab": 10000,
+   "data": "data/ptb",
+   "device": "cuda",
+   "optimizer": "adam",
+   "lr": 0.001,
+   "epochs": 10
+  },
+  "train_seconds": 1235.8908405439997,
+  "train_loss": 4.81167327737191,
+  "train_acc": null,
+  "test_loss": 5.772721947489918,
+  "test_acc": 0.1606691919191919,
+  "test_perplexity": 321.4114080340013
+ }
+}
