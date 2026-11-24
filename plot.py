@@ -433,6 +433,11 @@ def fig_sweeps(plt, ctx):
             ax.margins(y=0.15)
             if j == 2:
                 ax.set_ylim(bottom=0)
+                # without eps the controller skips the error estimate: say so instead of a gap
+                for x, r in zip(xs, sel):
+                    if get(r) is None and cfg(r).get("eps") is None:
+                        ax.annotate("not estimated\n(no ε)", (x, 0.5), xycoords=("data", "axes fraction"),
+                                    ha="center", va="center", fontsize=7.5, color=t["muted"], linespacing=1.2)
             grid(ax, "y")
             ax.set_xlabel(xlabel if j == 0 else "")
             ax.set_title(ylabel)
