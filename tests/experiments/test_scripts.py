@@ -97,6 +97,6 @@ def test_plot_every_figure(tmp_path):
     written = main([str(tmp_path), "--out", str(out)])
     assert sorted(written) == sorted(str(out / f"{f}.png") for f in FIGURES)
     assert all((out / f"{f}.png").stat().st_size > 10_000 for f in FIGURES)
-    # without the reference run the relative figures are skipped, the rest still drawn
+    # one run: the figures that compare runs are skipped, the rest still drawn
     written = main([str(tmp_path / "lp_b60_e0.01.json"), "--out", str(out / "one"), "--theme", "dark"])
-    assert str(out / "one" / "plans.png") in written and str(out / "one" / "loss.png") not in written
+    assert str(out / "one" / "planning.png") in written and str(out / "one" / "sweeps.png") not in written

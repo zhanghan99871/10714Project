@@ -13,15 +13,13 @@ Runs are grouped by name: a fixed policy (--static, e.g. base_*), an ablation (a
 or an LP optimizer run (the rest). The figures:
 
     tradeoff    step time and test perplexity against peak memory, one point per run
-    overview    every run: ms/step, peak memory, test perplexity vs the reference,
-                planning time
+    overview    every run: ms/step, peak memory, test perplexity vs the reference
     sweeps      the LP runs along the memory budget (at the most common eps) and along
                 the error limit (at the most common budget), with the fixed policies as
                 reference lines
-    loss        training loss relative to the reference per epoch, one panel per run
     plans       the policy of every layer in every epoch, one panel per optimizer run
-    replanning  what the re-plans measured in the run with the most of them: the batch
-                noise, the fp16 error of every layer, the predicted error of the plan
+    planning    the time spent planning (profiling, error estimates, solving) against
+                the time spent training, LP and ablation runs
     model       measured vs predicted peak memory and step time of every plan
 
 Needs matplotlib (pip install matplotlib).
@@ -37,7 +35,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from apps.summarize_runs import MIB, compare, load, mode, stats  # noqa: E402
 
 GIB = 2 ** 30
-FIGURES = ["tradeoff", "overview", "sweeps", "loss", "plans", "replanning", "model"]
+FIGURES = ["tradeoff", "overview", "sweeps", "plans", "planning", "model"]
 
 # The reference palette of the dataviz method: chart chrome, ink and the categorical
 # slots (fixed order, light and dark steps of the same hues).
@@ -338,16 +336,14 @@ def fig_overview(plt, ctx):
         return None
     t, ref = ctx.t, ctx.ref
     rel = ref is not None and ref.get("test_ppl") is not None
-    fig, axes = plt.subplots(1, 4, figsize=(14, max(3.4, 1.5 + 0.34 * len(rows))), sharey=True, layout="constrained",
-                             gridspec_kw=dict(width_ratios=[1, 1, 1, 0.8]))
+    fig, axes = plt.subplots(1, 3, figsize=(12, max(3.4, 1.5 + 0.34 * len(rows))), sharey=True,
+                             layout="constrained")
     panels = [("ms per step", [r["ms_step"] for r in rows], lambda v: f"{v:.0f}", False,
                ref and ref["ms_step"]),
               ("peak memory (GiB)", [gib(r) for r in rows], lambda v: f"{v:.1f}", False, ref and gib(ref)),
               ("test perplexity vs " + ref["name"] + " (%)" if rel else "test perplexity",
                [pct(r["d_ppl"]) for r in rows] if rel else [r["test_ppl"] for r in rows],
-               (lambda v: f"{v:+.1f}%") if rel else (lambda v: f"{v:.1f}"), rel, None),
-              ("planning time (s)",
-               [r["planning_s"] if r["replans"] else None for r in rows], lambda v: f"{v:.0f}", False, None)]
+               (lambda v: f"{v:+.1f}%") if rel else (lambda v: f"{v:.1f}"), rel, None)]
     for ax, (title, values, fmt, centered, ref_x) in zip(axes, panels):
         bars(ax, ctx, rows, values, fmt, centered)
         if ref_x:
@@ -356,8 +352,7 @@ def fig_overview(plt, ctx):
     axes[0].set_yticks(range(len(rows)), [label(r) for r in rows])
     axes[0].tick_params(axis="y", labelcolor=t["secondary"])
     axes[0].invert_yaxis()
-    sub = ("ms/step: median over the epochs; memory: the largest epoch; perplexity: the test set after training; "
-           "planning: profiling + error estimates + solving, all re-plans.")
+    sub = "ms/step: median over the epochs; memory: the largest epoch; perplexity: the test set after training."
     if ref is not None:
         sub += f" Vertical rules: {ref['name']}."
     header(fig, t, "Every run at a glance", sub, group_handles(ctx, {r["group"] for r in rows}, marker="s"))
@@ -456,58 +451,6 @@ def fig_sweeps(plt, ctx):
     return fig
 
 
-def fig_loss(plt, ctx):
-    ref = ctx.ref
-    if ref is None:
-        return None
-    t = ctx.t
-    others = [r for r in ctx.runs if r is not ref and r["losses"]]
-    if not others:
-        return None
-
-    def rel(r):
-        return [None if a is None or b is None else 100 * (a - b) / b for a, b in zip(r["losses"], ref["losses"])]
-    curves = {r["name"]: rel(r) for r in others}
-    vals = [v for c in curves.values() for v in c if v is not None]
-    lim = max((abs(v) for v in vals), default=1) * 1.15 or 1
-    n = len(others) + 1
-    ncol = 4
-    nrow = -(-n // ncol)
-    fig, axes = plt.subplots(nrow, ncol, figsize=(14, 0.9 + 2.15 * nrow), layout="constrained", squeeze=False)
-    flat = axes.ravel()
-    ax = flat[0]
-    ep = list(range(len(ref["losses"])))
-    ax.plot(ep, ref["losses"], color=ctx.color[ref["group"]])
-    ax.set_title(f"{ref['name']}: training loss")
-    grid(ax)
-    for ax, r in zip(flat[1:], others):
-        for other in others:
-            if other is not r:
-                c = curves[other["name"]]
-                ax.plot(range(len(c)), c, color=t["context"], lw=0.9, zorder=1)
-        c = curves[r["name"]]
-        ax.axhline(0, color=t["baseline"], lw=0.8, zorder=1)
-        ax.plot(range(len(c)), c, color=ctx.color[r["group"]], zorder=3)
-        ax.set_ylim(-lim, lim)
-        ax.set_title(label(r))
-        grid(ax)
-    for ax in flat[n:]:
-        ax.set_visible(False)
-    for ax in flat[:n]:
-        ax.tick_params(labelsize=7.5)
-    for ax in axes[-1]:
-        ax.set_xlabel("epoch")
-    for i, row in enumerate(axes):
-        row[0].set_ylabel("training loss" if i == 0 else "loss vs reference (%)")
-    header(fig, t, f"Training loss of every run relative to {ref['name']}",
-           "Per epoch, (loss − reference) / reference; the other runs in gray for context. "
-           "Runs with the same fp16 layers repeat the same rounding, so their curves coincide.",
-           group_handles(ctx, {r["group"] for r in ctx.runs}))
-    fig.canvas.draw()
-    fig.set_layout_engine("none")
-    return fig
-
-
 def policy_colors(t):
     return {p: tint(t["series"][hue], t["surface"]) if light else t["series"][hue] for p, _, hue, light in POLICIES}
 
@@ -559,58 +502,65 @@ def fig_plans(plt, ctx):
     return fig
 
 
-def fig_replanning(plt, ctx):
-    cands = [r for r in ctx.runs if any("noise" in h and h.get("segment_errors") for h in r["log"].get("replans", []))]
-    if not cands:
+def fig_planning(plt, ctx):
+    rows = [r for r in ctx.by_group("lp", "ablation") if r["log"].get("replans")]
+    if not rows:
         return None
+    from matplotlib.patches import Patch
     t = ctx.t
-    run = max(cands, key=lambda r: (len(r["log"]["replans"]), r["name"]))
-    hist = [h for h in run["log"]["replans"] if "noise" in h and h.get("segment_errors")]
-    eps = run["log"]["config"].get("eps")
-    metric = run["log"]["config"].get("metric", "grad")
-    ep = [h["epoch"] for h in hist]
-    fig, axes = plt.subplots(1, 3, figsize=(14, 4.6), layout="constrained")
-    neutral = t["secondary"]
+
+    def part(r, key):
+        return sum(h.get("seconds", {}).get(key, 0.0) for h in r["log"]["replans"])
+    train = [sum(e.get("seconds") or 0.0 for e in r["log"]["epochs"]) for r in rows]
+    profile = [part(r, "profile") for r in rows]
+    rest = [part(r, "errors") + part(r, "solve") for r in rows]  # the solve itself is well under a second
+    plan = [p + q for p, q in zip(profile, rest)]
+    accent = t["series"][0]
+    full = [accent] * len(rows)
+    faded = [tint(accent, t["surface"], 0.45)] * len(rows)
+    ys = list(range(len(rows)))
+    fig, axes = plt.subplots(1, 2, figsize=(12, max(3.4, 1.6 + 0.36 * len(rows))), sharey=True, layout="constrained",
+                             gridspec_kw=dict(width_ratios=[1.25, 1]))
+
+    def stack(ax, segments, labels):
+        left = [0.0] * len(rows)
+        for widths, colors in segments:
+            ax.barh(ys, widths, left=left, height=0.56, color=colors, zorder=2, linewidth=0)
+            left = [a + b for a, b in zip(left, widths)]
+        span = max(left) or 1
+        for y, x, text in zip(ys, left, labels):
+            ax.text(x + 0.015 * span, y, text, va="center", ha="left", fontsize=7.5, color=t["secondary"])
+        ax.set_xlim(0, (1.12 if len(max(labels, key=len)) < 10 else 1.45) * span)
+        ax.axvline(0, color=t["baseline"], lw=0.8, zorder=3)
+        ax.spines["left"].set_visible(False)
+        ax.tick_params(axis="y", length=0)
+        grid(ax, "x")
 
     ax = axes[0]
-    ax.plot(ep, [h["noise"] for h in hist], color=neutral, marker="o", ms=5, mec=t["surface"])
-    ax.set_title("batch noise " + ("E‖g_b − ḡ‖²" if metric == "grad" else "Var(L_b)"))
-    ax.set_ylim(bottom=0)
-    grid(ax)
-
+    stack(ax, [(train, [t["context"]] * len(rows)), (profile, full), (rest, faded)],
+          [f"{a + b:.0f} s" for a, b in zip(train, plan)])
+    ax.set_title("training + planning, whole run (s)")
     ax = axes[1]
-    nseg = len(hist[0]["segment_errors"])
-    items = []
-    for s in range(nseg):
-        ys = [h["segment_errors"][s] for h in hist]
-        ax.plot(ep, ys, color=t["series"][s % len(t["series"])], lw=1.8)
-        items.append((ys[-1], f"layer {s}"))
-    if eps is not None:
-        ax.axhline(eps, color=t["ink"], lw=1, zorder=1)
-        ax.annotate(f"ε = {eps:g}", (0, eps), xycoords=("axes fraction", "data"), xytext=(2, 3),
-                    textcoords="offset points", fontsize=7.5, color=t["secondary"])
-    ax.set_title("error of one layer in fp16 (RMS / noise)")
-    ax.set_ylim(bottom=0, top=max(max(h["segment_errors"]) for h in hist + [{"segment_errors": [eps or 0]}]) * 1.2)
-    grid(ax)
-    placer = end_labels(fig, ax, items, t)
-
-    ax = axes[2]
-    pe = [(h["epoch"], h["predicted_error"]) for h in hist if h.get("predicted_error") is not None]
-    if pe:
-        ax.plot(*zip(*pe), color=neutral, marker="o", ms=5, mec=t["surface"])
-    if eps is not None:
-        ax.axhline(eps, color=t["ink"], lw=1, zorder=1)
-        ax.annotate(f"ε = {eps:g}", (0, eps), xycoords=("axes fraction", "data"), xytext=(2, 3),
-                    textcoords="offset points", fontsize=7.5, color=t["secondary"])
-    ax.set_ylim(bottom=0, top=max([v for _, v in pe] + [eps or 0]) * 1.2)
-    ax.set_title("predicted error of the chosen plan")
-    grid(ax)
-    for ax in axes:
-        ax.set_xlabel("epoch of the re-plan")
-    header(fig, t, f"What the re-plans measured in {run['name']} ({run_mode(run)})",
-           "The errors are RMS fractions of the batch noise measured at the same re-plan; they add in squares, "
-           "so ε admits roughly (ε / layer error)² layers in fp16.")
-    finalize(fig, [placer])
+    notes = []
+    for r, p, tr in zip(rows, plan, train):
+        if r["log"]["config"].get("eps") is None:
+            notes.append(f"{p:.0f} s  ·  no ε, no error estimate")
+        else:
+            notes.append(f"{p:.0f} s  ·  {100 * p / tr:.1f}% of training" if tr else f"{p:.0f} s")
+    stack(ax, [(profile, full), (rest, faded)], notes)
+    ax.set_title("planning only (s)")
+    axes[0].set_yticks(ys, [label(r) for r in rows])
+    axes[0].tick_params(axis="y", labelcolor=t["secondary"])
+    axes[0].invert_yaxis()
+    handles = [Patch(color=t["context"], label="training (all epochs)"), Patch(color=full[0], label="profiling"),
+               Patch(color=faded[0], label="error estimates + MILP solve")]
+    profiled = [r["name"] for r in rows if any(h.get("profiled") for h in r["log"]["replans"])]
+    sub = "Planning sums every re-plan of the run; the MILP solve itself takes under a second."
+    if profiled and len(profiled) < len(rows):
+        sub += f" Only {', '.join(profiled)} profiled the model; the other runs reused its saved profile."
+    header(fig, t, "Time spent planning against time spent training", sub, handles)
+    fig.canvas.draw()
+    fig.set_layout_engine("none")
     return fig
 
 
@@ -661,8 +611,8 @@ def fig_model(plt, ctx):
     return fig
 
 
-BUILDERS = dict(tradeoff=fig_tradeoff, overview=fig_overview, sweeps=fig_sweeps, loss=fig_loss, plans=fig_plans,
-                replanning=fig_replanning, model=fig_model)
+BUILDERS = dict(tradeoff=fig_tradeoff, overview=fig_overview, sweeps=fig_sweeps, plans=fig_plans,
+                planning=fig_planning, model=fig_model)
 
 
 def main(argv=None):
