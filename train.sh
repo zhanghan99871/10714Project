@@ -7,6 +7,7 @@
 #                           half_softmax, cost of the error estimate
 #   ./train.sh all          baseline, lp and ablation, then the summary
 #   ./train.sh summary      only the comparison table (time, memory, error)
+#   ./train.sh plot         the figures of plot.py in $OUT/plots (needs matplotlib)
 #   ./train.sh list         print the commands without running them
 #   ./train.sh RUN_NAME...  only these runs (e.g. ./train.sh base_fp32 lp_b55_e0.01)
 #
@@ -135,6 +136,11 @@ summary() {
   python apps/summarize_runs.py "$OUT" --reference base_fp32 --csv "$OUT/summary.csv"
 }
 
+plot() {
+  [[ "$DRY_RUN" == 1 ]] && return
+  python plot.py "$OUT" --reference base_fp32
+}
+
 finish() {
   if (( ${#FAILED[@]} )); then
     echo "failed runs: ${FAILED[*]}"
@@ -148,6 +154,7 @@ case "${1:-all}" in
   ablation) ablation; finish ;;
   all) baseline; lp_runs; ablation; summary; finish ;;
   summary) summary ;;
+  plot) plot ;;
   list) DRY_RUN=1; baseline; lp_runs; ablation ;;
   -h|--help|help) sed -n '2,/^set -uo/p' "$0" | sed '$d' | sed 's/^# \{0,1\}//' ;;
   *) SELECTED=("$@"); baseline; lp_runs; ablation; finish ;;

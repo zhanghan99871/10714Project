@@ -64,3 +64,39 @@ def test_save_and_reuse_a_profile(tmp_path, monkeypatch):
     second = main(common + ["--profile", str(path)])
     assert second.profile == saved and not second.history[0]["profiled"]
     assert second.plan.policies == first.plan.policies  # the same cost table, the same plan
+
+
+def test_plot_every_figure(tmp_path):
+    pytest.importorskip("matplotlib")
+    from plot import FIGURES, main
+
+    def replan(epoch, policies, feasible=True):
+        return {"epoch": epoch, "policies": policies, "feasible": feasible, "predicted_error": 0.008,
+                "segment_errors": [0.006, 0.009], "noise": 10.0 / (1 + epoch), "mean_loss": 5.0,
+                "seconds": {"profile": 1.0, "errors": 2.0, "solve": 0.1}}
+
+    def lp_log(budget, eps, policies, feasible=True, ppl=310.0, ms=90.0):
+        epochs = [{"epoch": i, "policies": p, "loss": 5.0 - i / 10, "seconds": ms * 10 / 1e3, "steps": 10,
+                   "measured_peak": 600 * MIB, "predicted_peak": 598 * MIB, "predicted_step_time": 0.088,
+                   "over_budget": False, "skipped_steps": 0} for i, p in enumerate(policies)]
+        return {"config": {"static_policies": None, "budget_fraction": budget, "eps": eps, "metric": "grad",
+                           "replan_every": 2, "policies": None, "grad_batches": 2, "half_softmax": True},
+                "replans": [replan(i, policies[i], feasible) for i in range(0, len(policies), 2)],
+                "epochs": epochs, "results": {"test_perplexity": ppl}}
+
+    write_log(tmp_path / "base_fp32.json", static=["fp32", "fp32"], ms=(100, 100, 100, 100),
+              losses=(5.0, 4.9, 4.8, 4.7))
+    write_log(tmp_path / "base_fp16.json", static=["fp16", "fp16"], ms=(80, 80, 80, 80), peak=800,
+              losses=(5.0, 4.9, 4.8, 4.71), ppl=305.0)
+    plan = [["fp32", "none"], ["fp32", "none"], ["fp16", "fp16_none"], ["fp16", "fp16_none"]]
+    for name, budget, eps, feasible in [("lp_b40_e0.01", 0.4, 0.01, False), ("lp_b60_e0.01", 0.6, 0.01, True),
+                                        ("lp_b60_e0.02", 0.6, 0.02, True), ("lp_b60_noeps", 0.6, None, True),
+                                        ("abl_k1", 0.6, 0.01, True)]:
+        (tmp_path / f"{name}.json").write_text(json.dumps(lp_log(budget, eps, plan, feasible)))
+    out = tmp_path / "plots"
+    written = main([str(tmp_path), "--out", str(out)])
+    assert sorted(written) == sorted(str(out / f"{f}.png") for f in FIGURES)
+    assert all((out / f"{f}.png").stat().st_size > 10_000 for f in FIGURES)
+    # without the reference run the relative figures are skipped, the rest still drawn
+    written = main([str(tmp_path / "lp_b60_e0.01.json"), "--out", str(out / "one"), "--theme", "dark"])
+    assert str(out / "one" / "plans.png") in written and str(out / "one" / "loss.png") not in written
