@@ -315,7 +315,7 @@ def evaluate_cifar10(model, dataloader, loss_fn=nn.SoftmaxLoss, amp=False):
 
 ### PTB training ###
 def epoch_general_ptb(data, model, seq_len=40, loss_fn=nn.SoftmaxLoss(), opt=None,
-        clip=None, device=None, dtype="float32", amp=False, scaler=None):
+        clip=None, device=None, dtype="float32", amp=False, scaler=None, verbose=True):
     """
     Iterates over the data. If optimizer is not None, sets the
     model to train mode, and for each batch updates the model parameters.
@@ -365,26 +365,31 @@ def epoch_general_ptb(data, model, seq_len=40, loss_fn=nn.SoftmaxLoss(), opt=Non
             h = tuple(state.detach() for state in h)
         else:
             h = h.detach()
-        logits = output.numpy()
-        labels = y.numpy()
+        if verbose:
+            logits = output.numpy()
+            labels = y.numpy()
 
-        predictions = np.argmax(logits, axis=1)
+            predictions = np.argmax(logits, axis=1)
+            total_correct += np.sum(predictions == labels)
+            
         num_tokens = y.shape[0]
-        total_correct += np.sum(predictions == labels)
         total_loss += loss.numpy().item() * num_tokens
         total_samples += num_tokens
         del output, loss  # see epoch_general_cifar10
-
-    avg_acc = total_correct / total_samples
+        
     avg_loss = total_loss / total_samples
 
-    return avg_acc, avg_loss
+    if verbose:
+        avg_acc = total_correct / total_samples
+        return avg_acc, avg_loss 
+    else:
+        return None, avg_loss  
     ### END YOUR SOLUTION
 
 
 def train_ptb(model, data, seq_len=40, n_epochs=1, optimizer=ndl.optim.SGD,
           lr=4.0, weight_decay=0.0, loss_fn=nn.SoftmaxLoss, clip=None,
-          device=None, dtype="float32", amp=False, scaler=None, controller=None):
+          device=None, dtype="float32", amp=False, scaler=None, controller=None, verbose=True):
     """
     Performs {n_epochs} epochs of training.
 
@@ -438,7 +443,7 @@ def train_ptb(model, data, seq_len=40, n_epochs=1, optimizer=ndl.optim.SGD,
             ndl.backend_ndarray.reset_peak_memory_stats(device)
             start = time.perf_counter()
         acc, loss = epoch_general_ptb(data, model, seq_len, criterion, opt, clip, device, dtype,
-                                      amp=amp, scaler=scaler)
+                                      amp=amp, scaler=scaler, verbose=verbose)
         if controller is not None:
             controller.after_epoch(i, loss=loss, acc=acc, seconds=time.perf_counter() - start,
                                    peak=ndl.backend_ndarray.max_memory_allocated(device),
