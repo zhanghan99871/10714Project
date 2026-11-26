@@ -1,6 +1,3 @@
-# Minimum Python packages for this project (see README.md for the full setup).
-# Install with:  pip install -r requirements.txt
-
 # needle and the policy optimizer
 numpy>=1.24
 scipy>=1.9          # scipy.optimize.milp, the MILP planner
